@@ -1,0 +1,18 @@
+[project]
+name = "kryta-construction-set"
+version = "0.1.0"
+description = "A Construction Set style map editor for Kryta: sculpt a map, build it with Rurik's writer, install it into Gw.dat and publish it to the world"
+requires-python = ">=3.10"
+dependencies = ["PySide6>=6.5"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+kryta-cs = "kryta_cs.ui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["kryta_cs*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

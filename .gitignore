@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+# kept local: notes and game-derived screenshots
+history.doc
+docs/

@@ -1,0 +1,903 @@
+"""Plan a write into Gw.dat. Compute every byte that would change; change none.
+
+THIS MODULE NEVER OPENS THE ARCHIVE FOR WRITING. It exists to answer a question
+the skills study left open -- "no tool in our entire evidence base can write to
+Gw.dat" -- by separating two things that were tangled together in that sentence:
+whether the edit is *computable*, and whether the client *accepts* it. The first
+is a tooling question and this module settles it. The second is an empirical
+question about a running client and no amount of planning answers it.
+
+So a plan is not permission. It is the exact diff you would apply if you decided
+to, printed so it can be argued with before anything is at risk.
+
+WHAT A WRITER HAS TO GET RIGHT, all MEASURED (see test_datcrc.py, which asserts
+the first three against the corpus rather than trusting this docstring):
+
+  1. Offsets are 512-byte aligned. Every one of 177,329 entries, GCD exactly 512.
+  2. Space is reserved in whole blocks -- size rounded up. 176,033 of 177,329
+     entries sit exactly that far from their neighbour, so the allocator packs
+     to block granularity and the leftover inside the last block is dead space
+     that belongs to the entry.
+  3. The crc at entry+0x14 is CRC-32/ISO-HDLC over the STORED bytes, the
+     compressed form on disk, not the payload. Get this wrong and the archive is
+     self-inconsistent even if the client never looks.
+  4. A file is only addressable by id if the file-id table at MFT row 2 maps it.
+     That table is a stored array of (file_id u32, row u32) pairs.
+
+  5. MFT row 3 describes the table itself, and its crc covers the table with its
+     own 24-byte row skipped. An earlier pass of this file claimed that crc was
+     "stale by construction" and read the client's tolerance of it as evidence
+     that crcs are not checked. That was wrong twice over: the rule exists, and
+     no such tolerance was ever demonstrated. See datwrite.py:mft_self_crc.
+
+  6. "Free" is not free. The gap-between-reservations measure counts LIVE
+     CONTAINER GENERATIONS as available space, and this file used to place new
+     files directly on top of them -- see the block comment on free_runs().
+
+  7. A generation whose HEAD was overwritten is still a generation. The two
+     rules that find one -- the `Mft\x1a` signature and the extent it declares
+     -- both need the header, and on `vault/dat_study_38833` the live file-id
+     table sits exactly where a stale MFT generation's header was, so its
+     2,892,800-byte tail read as the largest usable run in the archive, 100.0%
+     of it live table rows. The third rule reads the ROWS: see mft_content()
+     and the block comment on classify_runs() (DESKWORK-Q4, 2026-09-24).
+
+AND THE ONE THAT IS NOT SETTLED: whether the client validates any of it on read,
+and whether a modification survives a play session. Both are open, and nothing
+here leans either way -- the one piece of evidence this docstring used to cite
+for tolerance was a misreading. Read studies/datwrite/FINDINGS.md before acting
+on a plan.
+
+    python toolkit/mapdata/datplan.py --insert 4096
+    python toolkit/mapdata/datplan.py --overwrite 22371
+    python toolkit/mapdata/datplan.py --free
+"""
+
+import argparse
+import binascii
+import os
+import re
+import struct
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from archive import (Archive, DEFAULT_DAT, ENTRY_SIZE,  # noqa: E402
+                     MFT_MAGIC, mft_row_offset, FLAG_ENTRY_USED,
+                     FILE_ID_TABLE_ROW, MFT_SELF_ROW, FIRST_CLAIMABLE_ROW)
+
+# Offsets into the 32-byte file header and the 24-byte MFT header, for the
+# fields a growing table forces us to touch.
+HDR_MFT_SIZE = 0x18
+MFT_HDR_COUNT = 0x0C
+
+# FILE_ID_TABLE_ROW (2), MFT_SELF_ROW (3) and FIRST_CLAIMABLE_ROW (16) are
+# imported from `archive.py`, which owns the row convention. This module used to
+# declare its own copies of the last two, and THEN USED THEM WITH THE WRONG
+# ARITHMETIC: `mft_offset + (MFT_SELF_ROW - 1) * ENTRY_SIZE` is row 2, not row 3.
+# `entries` skips the descriptor and the table on disk does not, so a `- 1`
+# belongs in a subscript and never in an address. Every MFT address below now
+# goes through `archive.mft_row_offset`, which is the same function
+# `datwrite.row_offset` calls. See test_datplan.py §8.
+
+# How many (file_id, row) pairs must all name a live MFT row before we call a
+# block the head of a file-id table. MEASURED on vault/dat_study/Gw.dat: at every
+# sample size from 4 to 128 pairs this rule selects exactly the two known table
+# generations out of 214 runs and nothing else, so the value is not delicately
+# tuned. 32 pairs is 256 bytes, which also covers the 24-byte MFT header, so one
+# read serves both tests.
+CONTAINER_PROBE_PAIRS = 32
+CONTAINER_PROBE_BYTES = CONTAINER_PROBE_PAIRS * 8
+
+# The content detector (DESKWORK-Q4, 2026-09-24). A free run's bytes are parsed
+# as 24-byte MFT records at each of six 4-byte phases -- the table is 8-byte
+# aligned and 512 mod 24 = 8, so a generation's rows sit at phase 0, 8 or 16 of
+# whichever block a free run happens to start in; six covers every alignment a
+# 4-byte field can take and costs nothing -- and the phase with the most records
+# BYTE-IDENTICAL to a live row of this archive's own table is the run's score.
+# All-zero records are excluded: an erased row is zero and so is empty space.
+#
+# MEASURED 2026-09-24 over every usable free run of all 32 archive-size .dat
+# files in the vault -- the 21 Gw.dat copies under client/, dat_*/, run/ and
+# run-live/ (DESKWORK-Q4's sweep) plus the 11 under exports/ (its review's),
+# read-only. The runs that are an overwritten-head generation score
+# 0.997..1.000 of their non-zero records identical -- dat_study_38833's
+# 0xF5923800: 120,507 of 120,533; the 38833-line archives' 0xF8A5E200: 11,859
+# of 11,882 and 0xF8FD7C00: 6,675 of 6,698; the 38888-line archives'
+# 0xFC84F200: 25,445 of 25,450 -- and on the 38833 and 08-20 lines every other
+# usable run scores exactly zero.
+#
+# THE FLOOR IS NOT ZERO EVERYWHERE, and the first draft of this comment said
+# it was. On the 38797-line copies (dat_study_38797, dat_c2, reskin-roster,
+# the July run directories) a dozen small runs each carry 1..20 identical
+# records at 1%..76% -- and decoding them record by record shows what they
+# are: CONTIGUOUS spans of table rows (72325..72340 in a single 512-byte block
+# at 0xDC29D800; 1267..1279 at 0x0731D000) with the rest of the run decoding
+# as junk, i.e. compressed payload. They are slivers of an old table block
+# that survived the client reusing the region for files. That is why the
+# trigger has TWO terms:
+#
+#   * the COUNT -- at least MFT_CONTENT_MIN_ROWS identical records, so that a
+#     lone row in a block of zeros does not withhold anything; and
+#   * the MAJORITY -- identical records at least MFT_CONTENT_MAJORITY of the
+#     NON-ZERO ones. Junk around old rows is the client's own evidence that it
+#     hands the region to files; a run that is rows end to end has never been
+#     reused and is the shape of a slot the table rotates through. Zeros are
+#     excluded from the denominator because a generation's growth area and
+#     empty space are both zero and say nothing either way.
+#
+# The line sits at one half, and THE RESIDUE ON EACH SIDE OF IT IS NAMED
+# rather than tuned away (the second draft of this paragraph claimed a clean
+# band -- "every multi-block run is 99.7%+ or under 3%" -- and the review's
+# sweep refuted it):
+#
+#   * WITHHELD by the majority term although they are slivers, not tails: the
+#     single-block runs 0xDC29D800 (16 of 21, 76%, on every 38797-line copy),
+#     0xF53F9C00 (57%, run-live/2026-07-29) and 0xFAAE2000 (18 of 21, 86%, the
+#     38888 line; 3 junk records then rows 177774..177791). A block each; the
+#     mark states the count and nothing about how the rows got there.
+#   * LEFT USABLE by the majority term ALONE (at least 8 identical rows, under
+#     one half of the non-zero records) -- the complete set, every usable run
+#     of the 21 Gw.dat copies re-scored through classify_runs on 2026-09-24
+#     (the review's RV2-2: the first list here named two runs the COUNT term
+#     spares, 0xF5595400 at 6 of 106 and 0xF6DD5400 at 4 of 42, and missed
+#     nine of these). On the 38797 line -- client/2026-07-29 and the seven
+#     copies made from it (dat_c2, dat_durability, dat_study_38797,
+#     reskin-roster, the -c2 and -probe run copies, run-live): 0x323A400 (25
+#     blocks, 9 of 533), 0x731D000 (41, 13 of 874), 0x9662A00 (1 block, 8 of
+#     20, 40%), 0xF53F7800 (19, 12 of 405), 0xF542FE00 (18, 13 of 383) and
+#     0xF567E200 (3, 20 of 63, 32%, rows 173569..173588 at the run's end),
+#     the union over those copies: the -probe copy lacks 0xF567E200, the
+#     run-live copy keeps only 0x731D000 (its live sessions wrote over the
+#     rest), and 0xF5731C00 (39, 11 of 832) appears ONLY on copies the client
+#     has run (dat_c2, dat_durability, dat_study_38797, -c2, run-live), never
+#     on the pristine one. On client/2026-04-30: 0x731D000 again, 0x9660C00 (16, 8 of 340),
+#     0xDC280800 (233, 16 of 4,970), 0xF53F6E00 (24, 12 of 511), 0xF5677800
+#     (56, 20 of 1,194) and 0xF8449200 (921, 19 of 19,647). On the 38888 line:
+#     0xF9A62600 (1,038 blocks, 20 of 22,144) and 0xF9EF4A00 (10 blocks, 69 of
+#     213, 32%): 135 records of payload FOLLOWED by a contiguous tail of rows
+#     177714..177791 running to the run's end -- and best_fit writes a payload
+#     from the run's START, so any 7..10-block file (3.1..5.1 KB;
+#     WORLDMAPS-W6's 4,820 B map is one) would overwrite those rows. That is
+#     the honest cost of the whole-run fraction: the rows are stale (their
+#     generation's head is under the file in front of them), and whether the
+#     client can ever return to such a generation is studies/archivewrite's
+#     standing UNVERIFIED, so this rule does not claim that overwriting them
+#     is safe -- only that the region already went to a file once. Everything
+#     below one percent in that list is payload with a few row-shaped records
+#     in it; the 38833 and 08-20 lines have NO usable run with a single
+#     identical row. A per-BLOCK rule (withhold the row-bearing blocks, keep
+#     the payload blocks) would catch both lists consistently and is the next
+#     refinement if that question ever gets an answer.
+#   * BELOW THE COUNT, whatever their fraction: a dozen single blocks and small
+#     runs with 1..7 identical rows -- 0xF56B3400 (6 of 21, 29%), 0xF5595C00 (6
+#     of 21), 0xF5595400 (5 blocks, 6 of 106), 0xF6DD5400 (2 blocks, 4 of 42),
+#     0xF5379A00 (4 of 20) and the like -- usable by the count term alone.
+MFT_CONTENT_PHASES = tuple(range(0, ENTRY_SIZE, 4))
+MFT_CONTENT_MIN_ROWS = 8
+MFT_CONTENT_MAJORITY = 0.5
+MFT_CONTENT_CHUNK = 1536 * 683       # 1,049,088 B: a multiple of the 512-byte
+                                     # block AND the 24-byte record, so a
+                                     # phase keeps its alignment across chunks
+KIND_MFT_CONTENT = "stale MFT rows"
+ZERO_ROW = bytes(ENTRY_SIZE)
+
+
+def blocks_for(size, block):
+    return -(-size // block)
+
+
+class Edit:
+    """One contiguous byte range that would change, and why."""
+
+    __slots__ = ("offset", "length", "what", "detail")
+
+    def __init__(self, offset, length, what, detail=""):
+        self.offset = offset
+        self.length = length
+        self.what = what
+        self.detail = detail
+
+    def __repr__(self):
+        return f"<Edit 0x{self.offset:X} +{self.length} {self.what}>"
+
+
+class Plan:
+    def __init__(self, summary):
+        self.summary = summary
+        self.edits = []
+        self.notes = []
+        self.blockers = []
+        self.excluded = []      # [Exclusion], the runs this plan refused to use
+
+    def add(self, offset, length, what, detail=""):
+        self.edits.append(Edit(offset, length, what, detail))
+
+    @property
+    def bytes_touched(self):
+        return sum(e.length for e in self.edits)
+
+    def show_excluded(self, block):
+        """Name every run the container rule withheld. Never silent.
+
+        A planner that quietly dropped 88.5% of the space it was asked about
+        would be reporting a different archive than the one on disk.
+        """
+        if not self.excluded:
+            return
+        held = sum(x.blocks for x in self.excluded) * block
+        print(f"\n  withheld {len(self.excluded)} run(s), {held} bytes, as live "
+              f"container generations or stale MFT rows:")
+        for x in sorted(self.excluded, key=lambda r: r.start_block):
+            print(f"    0x{x.start_block * block:012X}  {x.blocks * block:>11} "
+                  f"bytes  {x.why()}")
+
+    def show(self, block=512):
+        print(self.summary)
+        if self.blockers:
+            print("\n  BLOCKED:")
+            for b in self.blockers:
+                print(f"    - {b}")
+            self.show_excluded(block)
+            return
+        print(f"\n  {len(self.edits)} edit(s), {self.bytes_touched} bytes changed:")
+        for e in sorted(self.edits, key=lambda x: x.offset):
+            print(f"    0x{e.offset:012X}  +{e.length:<9} {e.what}")
+            if e.detail:
+                print(f"                              {e.detail}")
+        self.show_excluded(block)
+        if self.notes:
+            print("\n  notes:")
+            for n in self.notes:
+                print(f"    - {n}")
+
+
+def free_runs(ar):
+    """Runs of unallocated whole blocks, IN ADDRESS ORDER.
+
+    Counted in blocks, not bytes. The byte-level gap between two entries is
+    mostly dead space inside the earlier entry's own reservation -- 52.7 MB of
+    the archive is exactly that -- and none of it is usable for a new file.
+
+    "Unallocated" here means exactly one thing: no MFT row points at it. That is
+    a weaker statement than "free", and the gap between the two is where this
+    module's worst bug lived. See classify_runs().
+
+    ADDRESS ORDER IS DELIBERATE, and this function used to sort largest-first.
+    That ordering was not a presentation choice -- plan_insert() took the first
+    qualifying run, so the sort WAS the allocation policy, and no line of code
+    said so. Callers that want an order now ask for one where the decision is
+    visible: best_fit() to place a file, sorted(..., key=size) to print a report.
+    """
+    block = ar.block_size
+    filesize = os.path.getsize(ar.path)
+    nblocks = (filesize + block - 1) // block
+    bitmap = bytearray(nblocks)
+    bitmap[0] = 1
+    for e in ar.entries:
+        if not e.size:
+            continue
+        for b in range(e.offset // block, (e.offset + e.size - 1) // block + 1):
+            if b < nblocks:
+                bitmap[b] = 1
+    for b in range(ar.mft_offset // block,
+                   (ar.mft_offset + ar.mft_size - 1) // block + 1):
+        if b < nblocks:
+            bitmap[b] = 1
+    runs = []
+    run = 0
+    for b in range(nblocks):
+        if bitmap[b]:
+            if run:
+                runs.append((b - run, run))
+            run = 0
+        else:
+            run += 1
+    if run:
+        runs.append((nblocks - run, run))
+    return runs
+
+
+class Exclusion:
+    """One free run a writer may not have, and the evidence for saying so."""
+
+    __slots__ = ("start_block", "blocks", "marks")
+
+    def __init__(self, start_block, blocks, marks):
+        self.start_block = start_block
+        self.blocks = blocks
+        self.marks = marks          # [(block_within_run, kind, detail)]
+
+    def why(self):
+        kinds = sorted({k for _, k, _ in self.marks})
+        first = self.marks[0]
+        where = "at its head" if first[0] == 0 else f"{first[0]} blocks in"
+        return (f"{' and '.join(kinds)} ({len(self.marks)} marked block(s), "
+                f"first {where}: {first[2]})")
+
+    def __repr__(self):
+        return f"<Exclusion 0x{self.start_block:X} +{self.blocks}blk>"
+
+
+def container_signature(buf, entry_count):
+    """Name the container generation starting at this block boundary, or None.
+
+    Two signatures, both cheap and both refutable against the artifact:
+
+      * `Mft\\x1a`, the master file table's own magic. Self-describing: the entry
+        count at +0x0C says how far the table reaches.
+      * A run of (file_id u32, row u32) pairs whose every row names a live MFT
+        row. The file-id table is stored, not compressed, so its structure is
+        visible on disk with nothing decoded.
+
+    THE ID-TABLE TEST IS A HEURISTIC and is applied only to a sample at the head
+    of a block, never to a whole table -- the live table itself carries three
+    (0, 0) pairs deeper in, which the rule would reject. What earns it a place is
+    that it is measurably not trigger-happy: over the 214 free runs of
+    vault/dat_study/Gw.dat it fires on the two known table generations and on
+    nothing else, at every sample size from 4 pairs to 128.
+    """
+    if len(buf) < CONTAINER_PROBE_BYTES:
+        return None
+    if buf[:4] == MFT_MAGIC:
+        count = struct.unpack_from("<I", buf, MFT_HDR_COUNT)[0]
+        return ("master file table",
+                f"declares {count} entries = {count * ENTRY_SIZE} bytes")
+    for i in range(CONTAINER_PROBE_PAIRS):
+        _file_id, row = struct.unpack_from("<II", buf, i * 8)
+        if not 1 <= row <= entry_count:
+            return None
+    return ("file-id table",
+            f"{CONTAINER_PROBE_PAIRS} consecutive (file_id, row) pairs, every "
+            f"row in 1..{entry_count}")
+
+
+def scan_run(ar, start_block, nblocks):
+    """Every block boundary inside one run that carries a container signature.
+
+    EVERY boundary, not just the first. A head-only test is the obvious cheap
+    version and it is not enough: MEASURED on vault/dat_study/Gw.dat, the run at
+    0xF6772800 (374,784 bytes) begins with 428 blocks of ordinary stale data and
+    only then a file-id table generation, so a head test calls it clean and a
+    writer walks straight into the table.
+    """
+    block = ar.block_size
+    per_chunk = max(1, (1 << 20) // block)
+    marks = []
+    pos = 0
+    while pos < nblocks:
+        n = min(per_chunk, nblocks - pos)
+        ar.fh.seek((start_block + pos) * block)
+        data = ar.fh.read(n * block)
+        for k in range(len(data) // block):
+            head = data[k * block:k * block + CONTAINER_PROBE_BYTES]
+            sig = container_signature(head, ar.entry_count)
+            if sig:
+                marks.append((pos + k, sig[0], sig[1]))
+        pos += n
+    return marks
+
+
+def live_mft_rows(ar):
+    """Every non-zero 24-byte row of the LIVE table, as a set of raw bytes.
+
+    Raw bytes, not `Entry` objects: the identity test is "these 24 bytes sit in
+    the live table", and re-packing an entry would make the test compare our
+    packer against itself. The descriptor slot (row 0, the `Mft\\x1a` header)
+    is skipped; zero rows are skipped because empty space is zero too.
+    """
+    ar.fh.seek(ar.mft_offset)
+    table = ar.fh.read(ar.mft_size)
+    body = table[ENTRY_SIZE:len(table) - (len(table) % ENTRY_SIZE)]
+    return {rec for (rec,) in struct.iter_unpack(f"{ENTRY_SIZE}s", body)
+            if rec != ZERO_ROW}
+
+
+def mft_content(fh, offset, length, rows, phases=MFT_CONTENT_PHASES):
+    """How much of `length` bytes at `offset` is live MFT rows.
+
+    Returns (identical, nonzero, parsed, phase) at the phase with the most
+    identical records (ties to the lower phase). Reads in chunks that keep
+    every phase's alignment, and tests the one record per phase that straddles
+    a chunk boundary, so a run scores the same however it is chunked.
+    """
+    fmt = f"{ENTRY_SIZE}s"
+    tally = {p: [0, 0, 0] for p in phases}     # identical, nonzero, parsed
+    pos, tail = 0, b""
+    while pos < length:
+        fh.seek(offset + pos)
+        data = fh.read(min(MFT_CONTENT_CHUNK, length - pos))
+        if not data:
+            break                              # a run past EOF: score what is there
+        for p in phases:
+            t = tally[p]
+            straddle = ()
+            if p and len(tail) == ENTRY_SIZE and len(data) >= p:
+                straddle = ((tail[p:] + data[:p]),)
+            span = len(data) - p
+            span -= span % ENTRY_SIZE
+            body = data[p:p + span] if span > 0 else b""
+            for rec in straddle:
+                t[2] += 1
+                if rec != ZERO_ROW:
+                    t[1] += 1
+                    if rec in rows:
+                        t[0] += 1
+            for (rec,) in struct.iter_unpack(fmt, body):
+                t[2] += 1
+                if rec != ZERO_ROW:
+                    t[1] += 1
+                    if rec in rows:
+                        t[0] += 1
+        tail = data[-ENTRY_SIZE:]
+        pos += len(data)
+    best = max(phases, key=lambda p: (tally[p][0], tally[p][1], -p))
+    identical, nonzero, parsed = tally[best]
+    return identical, nonzero, parsed, best
+
+
+def content_mark(ar, start_block, nblocks, rows):
+    """The mark that withholds a run as stale MFT rows, or None."""
+    block = ar.block_size
+    identical, nonzero, parsed, phase = mft_content(
+        ar.fh, start_block * block, nblocks * block, rows)
+    if identical < MFT_CONTENT_MIN_ROWS or identical < MFT_CONTENT_MAJORITY * nonzero:
+        return None
+    # The mark states what was measured and nothing about how the rows got
+    # there: the same score fits a generation's tail whose head the live
+    # file-id table overwrote (0xF5923800) and a one-block sliver in a region
+    # the client reused (0xDC29D800), and the first version of this string
+    # asserted the former for both.
+    return (0, KIND_MFT_CONTENT,
+            f"{identical} of {nonzero} non-zero 24-byte records "
+            f"({identical / nonzero:.1%}) are byte-identical to live MFT rows at "
+            f"phase {phase} (best of {len(MFT_CONTENT_PHASES)}); withheld as stale "
+            f"table rows, no header to project an extent from")
+
+
+def classify_runs(ar, runs=None):
+    """Split free runs into the ones a writer may use and the ones it may not.
+
+    Returns (usable, excluded): a list of (start_block, blocks) in address order,
+    and a list of Exclusion.
+
+    WHY THIS EXISTS. "Unallocated" is measured as the gap between MFT
+    reservations, and the client's containers do not live in that measure. It
+    rotates its MFT and its file-id table between a small set of recurring slots,
+    writing the new generation into one and leaving the previous generation
+    intact in the other -- and the previous generation is pointed at by no MFT
+    row, so it reads as free. It is not free: it is the copy the client is about
+    to rotate back onto, and on this machine one of those slots is where the LIVE
+    MFT sits in a different copy of the archive (0xF8FFF000 in
+    vault/run/2026-07-29_221c13772c7a-probe/Gw.dat).
+
+    MEASURED on vault/dat_study/Gw.dat. Six of 214 runs carry a container
+    signature and they hold 29,160,448 of the 32,528,384 bytes the gap measure
+    calls free -- 89.6%. The largest, 14,718,976 bytes at 0xF8FFF000, is three
+    whole MFT generations laid end to end followed by file-id table generations,
+    and the tiling is exact rather than approximate: each header declares 177,342
+    entries, which is 8,313 blocks, and the next header sits at exactly +8313,
+    the third at +16626, and the id-table stretch begins at +24939 = 3 x 8313.
+    Three predictions that could each have missed and did not.
+
+    What is genuinely unclaimed is 3,367,936 bytes in 208 runs, largest 953,856.
+    That is the number that changes what a writer can plan: the median reservation
+    of the 349 map-flagged rows is 961,536, just above it, and 176 of those 349
+    are larger than the largest run left. For half the maps in the archive the
+    answer to "where does this go" is now nowhere, which is a true answer and was
+    not available while the largest hole looked like 14 MB.
+
+    A RUN IS WITHHELD WHOLE, never carved around. The tail of 0xF8FFF000 past the
+    generations it currently holds is precisely the space the next, larger
+    generation grows into, and "the container is only in the first 27,611 blocks"
+    is an argument for writing exactly where the client is about to write.
+
+    A MARK IS NOT THE END OF THE GENERATION IT NAMES, and until 2026-08-17 this
+    function behaved as though it were. `scan_run` finds the block where a
+    signature SITS; an MFT generation then declares how far it REACHES, at +0x0C,
+    and that extent can run past the end of the free run it started in. The next
+    run along carries no magic at any of its own boundaries -- it is the MIDDLE
+    of a table -- so it scored usable, and `best_fit` would hand a writer the
+    inside of a generation the client is about to rotate back onto.
+
+    Not hypothetical: studies/archivewrite/FINDINGS.md 1.5 measured a
+    2,892,800-byte run on the 38833 study copy lying 100.0% inside a stale
+    generation's declared extent and accepted by `plan_move` as free space. So
+    every mark's declared extent is now projected ACROSS run boundaries and any
+    run it reaches is withheld, whether or not that run carries a mark of its
+    own. The projection is one-directional on purpose -- a generation is claimed
+    forward from its header, because forward is the only direction a
+    self-describing table reaches -- and only the MFT signature participates,
+    because the file-id-table test is a head heuristic that declares no length.
+
+    A HEADER THAT IS GONE PROJECTS NOTHING, and until 2026-09-24 (DESKWORK-Q4)
+    that was the gap left after the fix above. Both rules need the `Mft\\x1a`
+    at the generation's head; on `vault/dat_study_38833` the LIVE file-id
+    table now occupies 0xF57D5000..0xF5923800, which is exactly where a stale
+    generation's header used to be, and the generation's tail from 0xF5923800
+    -- 2,892,800 bytes, 120,507 of its 120,533 non-zero records byte-identical
+    to live rows -- carried no magic at any boundary and no extent reached it,
+    so it was the LARGEST USABLE RUN in the archive. On the slice archive the
+    same shape at 0xF8A5E200 (11,859 of 11,882) was the largest usable run and
+    0xF8FD7C00 (160,768 B) the next -- which is NOT to say the next compose
+    would have written into either: best_fit is smallest-fit, and measured on
+    the slice before this rule a 4,820 B payload went to a 12-block run at
+    0x7857200 and the 8,192 B area reservation to a 23-block run at 0x4C19000.
+    A payload over 17,408 B (the largest run left usable now) would have been
+    placed in 0xF8FD7C00 and one over 160,768 B in 0xF8A5E200, and plan_move
+    on the 38833 copy accepted 1.1 MB and 2 MB moves into 0xF5923800; those
+    are what the rule protects. The third rule reads the rows
+    themselves (`mft_content`): a run whose bytes parse, at the best of six
+    phases, as at least MFT_CONTENT_MIN_ROWS records identical to live table
+    rows AND a MFT_CONTENT_MAJORITY of its non-zero records is withheld as
+    KIND_MFT_CONTENT, whole, with the count and the fraction in its mark (the
+    two terms are argued at the constants). It runs only on runs the first two
+    rules left usable, and it can only ADD exclusions. Ordinary stale payload
+    and empty (all-zero) space stay usable -- `test_datplan` §10 has both as
+    controls beside the planted case, and a reused region carrying a sliver of
+    old rows as a third.
+    """
+    if runs is None:
+        runs = free_runs(ar)
+
+    scanned = [(start, n, scan_run(ar, start, n)) for start, n in runs]
+
+    # Every declared extent, in absolute blocks, from every mark that declares
+    # one. Only the MFT signature is self-describing; the file-id-table
+    # heuristic names a head and nothing about length, so it claims its own
+    # block and no more.
+    per_block = ar.block_size
+    claimed = []
+    for start, _n, marks in scanned:
+        for at, kind, detail in marks:
+            if kind != "master file table":
+                continue
+            m = re.search(r"declares (\d+) entries", detail)
+            if not m:
+                continue
+            blocks = -(-(int(m.group(1)) * ENTRY_SIZE) // per_block)
+            claimed.append((start + at, start + at + blocks, detail))
+
+    usable, excluded = [], []
+    for start, n, marks in scanned:
+        reach = [c for c in claimed
+                 if c[0] < start + n and c[1] > start and not (c[0] >= start
+                                                               and c[0] < start + n)]
+        if marks:
+            excluded.append(Exclusion(start, n, marks))
+        elif reach:
+            # No signature of its own: this run is the INSIDE of a table whose
+            # header sits in an earlier run. Recorded with the same evidence
+            # shape so `why()` reads correctly, and marked at block 0 because
+            # that is where the claim enters this run.
+            excluded.append(Exclusion(start, n, [(
+                0, "master file table",
+                "no signature here -- inside the declared extent of the "
+                "generation at block 0x%X (%s)" % (reach[0][0], reach[0][2]))]))
+        else:
+            usable.append((start, n))
+
+    # The third rule: rows without a header. Only the runs the first two left
+    # usable are read, and the live table is read once, lazily, so an archive
+    # with nothing usable pays nothing.
+    rows = None
+    kept = []
+    for start, n in usable:
+        if rows is None:
+            rows = live_mft_rows(ar)
+        mark = content_mark(ar, start, n, rows)
+        if mark is not None:
+            excluded.append(Exclusion(start, n, [mark]))
+        else:
+            kept.append((start, n))
+    return kept, excluded
+
+
+def best_fit(runs, need):
+    """The smallest run of at least `need` blocks. Ties go to the lowest address.
+
+    SMALLEST, not largest, and the difference is the whole point. Taking the
+    first run of a largest-first list puts every new file at the head of the
+    biggest hole in the archive, which is exactly where the client parks its
+    container generations -- so the old policy did not merely fragment badly, it
+    aimed at the one region that must not be touched.
+
+    Best fit is also reported to be what the client's own allocator does -- the
+    reservation-safety pass read it at 0x00478C50, with a comparator at 0x00479280
+    seeded 0xFFFFFFFF that keeps only an exact fit or the smallest strictly-larger
+    run. UNVERIFIED HERE: nothing in this module re-derived that, and no test
+    covers it. It is the reason best fit was chosen over worst fit rather than a
+    property anything depends on -- the container rule in classify_runs() is what
+    actually makes a plan safe, and it holds whichever fit policy is in force.
+
+    The address tie-break carries no claim at all -- it is here so the same
+    archive and the same request always produce the same plan.
+    """
+    fits = [r for r in runs if r[1] >= need]
+    if not fits:
+        return None
+    return min(fits, key=lambda r: (r[1], r[0]))
+
+
+def free_rows(ar, include_reserved=False):
+    """MFT rows a writer can claim without growing the table.
+
+    A row is claimable when it is erased AND NOT IN USE. The second half was
+    missing until 2026-08-15: this asked `size == 0` alone, and that is not what
+    free means. `rebloat.py --arm` sets a map head's size to zero DELIBERATELY,
+    so the client recompiles the map from its partner, and an armed head is very
+    much in use -- it keeps its offset, its flags and its `nextStream` link to
+    the partner that holds the actual geometry.
+
+    MEASURED on `vault/dat_c2/Gw.dat`, the copy where an arm has actually
+    happened: this returned `[71496]` -- the armed head of map 143, flags 0x0103
+    (USED|FIRST_STREAM), chained to partner 71497. `plan_insert` prefers
+    `erased[0]` over appending, so the next insert into that archive would have
+    taken a live map's head row, orphaned its partner, and left file id 0x287D3
+    resolving to somebody else's payload. Nothing would have caught it: all three
+    crc rules still hold across the swap, and `datcheck` rule 6 skips size-0 rows
+    because they own no extent.
+
+    The client's own rule is the FLAG, not the size -- `LoadMft` pushes rows with
+    USED clear onto a spare stack and `NewEntry` pops it LIFO. This now asks the
+    same question the allocator does. On all four current archives the two
+    answers coincide, so this changes no figure that was ever right; it changes
+    the one that was wrong.
+
+    Excludes the reserved low rows by default; see FIRST_CLAIMABLE_ROW.
+    """
+    return [e.index for e in ar.entries
+            if e.size == 0
+            and not (e.flags & FLAG_ENTRY_USED)
+            and (include_reserved or e.index >= FIRST_CLAIMABLE_ROW)]
+
+
+def plan_insert(ar, payload_size, flags=3, compression=0, file_id=None,
+                classified=None):
+    """Add a brand-new file. The expensive case, and it is not very expensive.
+
+    `classified` is the (usable, excluded) pair from classify_runs(), so a caller
+    making several plans pays for the scan once.
+    """
+    block = ar.block_size
+    need = blocks_for(payload_size, block)
+    plan = Plan(f"INSERT a new {payload_size}-byte file "
+                f"(compression {compression}, flags {flags})")
+
+    usable, excluded = classified if classified else classify_runs(ar)
+    plan.excluded = excluded
+    fit = best_fit(usable, need)
+    if fit is None:
+        if not usable:
+            plan.blockers.append(
+                f"no usable free space at all for {need} blocks "
+                f"({need * block} bytes)")
+        else:
+            plan.blockers.append(
+                f"no usable free run of {need} blocks ({need * block} bytes); "
+                f"the largest that is not a container generation is "
+                f"{max(n for _, n in usable)} blocks")
+        withheld = [x for x in excluded if x.blocks >= need]
+        if withheld:
+            plan.blockers.append(
+                f"{len(withheld)} withheld run(s) WOULD have fit -- largest "
+                f"{max(x.blocks for x in withheld) * block} bytes. Placing the "
+                f"file there is what this planner used to do; see classify_runs")
+        return plan
+    at = fit[0] * block
+    plan.add(at, need * block, "payload",
+             f"{payload_size} bytes + {need * block - payload_size} bytes of "
+             f"block padding; best fit of {sum(1 for r in usable if r[1] >= need)} "
+             f"usable run(s) -- run has {fit[1]} blocks, using {need}")
+
+    # The MFT row. Reuse an erased slot if one exists, else append.
+    erased = free_rows(ar)
+    if erased:
+        row = erased[0]
+        plan.add(mft_row_offset(ar.mft_offset, row), ENTRY_SIZE,
+                 f"MFT row {row} (reusing an erased slot)",
+                 f"{len(erased)} erased rows available; no table growth needed")
+    else:
+        # The appended row is `row_count`, because rows run 0..row_count-1. This
+        # one was always right; the two below were not.
+        row = ar.row_count
+        plan.add(mft_row_offset(ar.mft_offset, row), ENTRY_SIZE,
+                 f"MFT row {row} (appended)")
+        plan.add(ar.mft_offset + MFT_HDR_COUNT, 4, "MFT header entry count",
+                 f"{ar.entry_count} -> {ar.entry_count + 1}")
+        plan.add(HDR_MFT_SIZE, 4, "file header: MFT size",
+                 f"{ar.mft_size} -> {ar.mft_size + ENTRY_SIZE}")
+        plan.add(mft_row_offset(ar.mft_offset, MFT_SELF_ROW), ENTRY_SIZE,
+                 f"MFT row {MFT_SELF_ROW} (the table describing itself)",
+                 "its size field must restate the new table size")
+        # Does the table have room to grow where it sits?
+        mft_end = ar.mft_offset + ar.mft_size
+        nxt = min((e.offset for e in ar.entries if e.size and e.offset >= mft_end),
+                  default=os.path.getsize(ar.path))
+        room = nxt - mft_end
+        # ...and `nxt` is the gap measure a third time. The bytes past the table
+        # belong to no MFT row, so they read as headroom; on this archive the
+        # first 14 MB of that headroom is the container arena the table itself
+        # rotates through, and the honest figure is two rows, not 613,292.
+        walls = [x.start_block * block + mk[0] * block
+                 for x in excluded for mk in x.marks
+                 if x.start_block * block + mk[0] * block >= mft_end]
+        wall = min(walls, default=None)
+        clear = room if wall is None else min(room, wall - mft_end)
+        if room < ENTRY_SIZE:
+            plan.blockers.append(
+                f"the MFT cannot grow in place: only {room} bytes before the "
+                f"next allocated entry at 0x{nxt:X}")
+        elif clear < ENTRY_SIZE:
+            plan.blockers.append(
+                f"the MFT cannot grow in place: {room} bytes before the next "
+                f"allocated entry at 0x{nxt:X}, but only {clear} before the "
+                f"container generation at 0x{wall:X}, which no MFT row points "
+                f"at and which the gap measure therefore counts as free")
+        else:
+            note = (f"the MFT can grow in place: {clear} bytes = "
+                    f"{clear // ENTRY_SIZE} more rows")
+            if wall is not None and clear < room:
+                note += (f" before the container generation at 0x{wall:X} "
+                         f"(the next ALLOCATED entry is far past it, at "
+                         f"0x{nxt:X} -- {room} bytes of apparent headroom, "
+                         f"which is the same gap measure that made this "
+                         f"planner place files on top of live containers)")
+            else:
+                note += f" before the next entry at 0x{nxt:X}"
+            plan.notes.append(note)
+
+    # The file-id table, so the client can address it at all.
+    tbl = ar.row(FILE_ID_TABLE_ROW)
+    tbl_reserved = blocks_for(tbl.size, block) * block
+    if file_id is None:
+        plan.notes.append("no file id requested; skipping the file-id table edit")
+    elif tbl.size + 8 <= tbl_reserved:
+        plan.add(tbl.offset + tbl.size, 8,
+                 f"file-id table: append (id {file_id}, row {row})",
+                 f"fits in the table's existing reservation "
+                 f"({tbl_reserved - tbl.size} bytes spare = "
+                 f"{(tbl_reserved - tbl.size) // 8} pairs)")
+        plan.add(mft_row_offset(ar.mft_offset, FILE_ID_TABLE_ROW), ENTRY_SIZE,
+                 f"MFT row {FILE_ID_TABLE_ROW}: file-id table size and crc",
+                 f"{tbl.size} -> {tbl.size + 8}")
+    else:
+        plan.blockers.append(
+            f"the file-id table has no room in its reservation "
+            f"({tbl.size} of {tbl_reserved} used); it would have to be relocated, "
+            f"which means finding {blocks_for(tbl.size + 8, block)} free blocks "
+            f"and moving {tbl.size} bytes")
+
+    plan.notes.append(
+        "every touched entry's crc must be recomputed as CRC-32/ISO-HDLC over its "
+        "stored bytes, and MFT row 3's own crc must be recomputed over the table "
+        "skipping its own 24-byte row -- see datwrite.py:mft_self_crc")
+    return plan
+
+
+def plan_overwrite(ar, row_index, new_size):
+    """Replace an existing file's contents. The cheap case.
+
+    THE TWO LINES BELOW USED TO DISAGREE ABOUT WHICH ROW THIS IS, and the plan
+    printed both without a word: the payload line resolved the row correctly
+    through `entries[row - 1]`, and the MFT line addressed
+    `mft_offset + (row - 1) * 24`, which is the row BEFORE it. `--overwrite 18`
+    emitted "payload of row 18" and "MFT row 18: size and crc" on consecutive
+    lines, and the second pointed at row 17's 24 bytes. This module applies
+    nothing, so that address was handed to a human to apply by hand.
+    """
+    block = ar.block_size
+    try:
+        e = ar.row(row_index)
+    except (IndexError, TypeError):
+        plan = Plan(f"OVERWRITE row {row_index}")
+        plan.blockers.append(f"no such row (archive has rows "
+                             f"1..{len(ar.entries)}; row_count {ar.row_count})")
+        return plan
+    reserved = blocks_for(e.size, block) * block
+    plan = Plan(f"OVERWRITE row {row_index}: {e.size} -> {new_size} bytes "
+                f"(reservation {reserved})")
+    if new_size > reserved:
+        plan.blockers.append(
+            f"{new_size} bytes will not fit the {reserved}-byte reservation; "
+            f"this becomes a relocation, not an overwrite")
+        plan.notes.append("plan an insert instead, then repoint the file-id table")
+        return plan
+    plan.add(e.offset, new_size, f"payload of row {row_index}",
+             f"in place; {reserved - new_size} bytes of the reservation unused")
+    plan.add(mft_row_offset(ar.mft_offset, row_index), ENTRY_SIZE,
+             f"MFT row {row_index}: size and crc",
+             f"crc = CRC-32 of the new stored bytes")
+    plan.notes.append(
+        "nothing else moves: no table growth, no file-id change, no relocation. "
+        "This is the cheapest possible modification of the archive.")
+    return plan
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dat", default=DEFAULT_DAT)
+    ap.add_argument("--insert", type=int, metavar="BYTES",
+                    help="plan inserting a new file of this stored size")
+    ap.add_argument("--file-id", type=int, default=None,
+                    help="with --insert, also plan the file-id table entry")
+    ap.add_argument("--overwrite", type=int, metavar="ROW",
+                    help="plan replacing an existing row's contents")
+    ap.add_argument("--new-size", type=int, default=None,
+                    help="with --overwrite, the new stored size (default: same)")
+    ap.add_argument("--free", action="store_true", help="report free space only")
+    args = ap.parse_args()
+
+    with Archive(args.dat) as ar:
+        print(f"{os.path.basename(args.dat)}: {ar.entry_count} entries, "
+              f"block size {ar.block_size}")
+        print("READ-ONLY. This tool computes plans and applies none of them.\n")
+
+        block = ar.block_size
+        classified = None
+
+        if args.free or args.insert:
+            classified = classify_runs(ar)
+
+        if args.free or not (args.insert or args.overwrite):
+            if classified is None:
+                classified = classify_runs(ar)
+            usable, excluded = classified
+            gap = sum(n for _, n in usable) * block
+            held = sum(x.blocks for x in excluded) * block
+            print(f"unallocated by the gap measure: {gap + held} bytes in "
+                  f"{len(usable) + len(excluded)} runs of whole blocks")
+            print(f"  withheld as live container generations or stale MFT rows: "
+                  f"{held} bytes in {len(excluded)} run(s)")
+            for x in sorted(excluded, key=lambda r: -r.blocks):
+                print(f"    0x{x.start_block*block:012X}  {x.blocks:>7} blocks  "
+                      f"{x.blocks*block:>11} bytes  {x.why()}")
+            print(f"  usable: {gap} bytes in {len(usable)} runs")
+            big = [r for r in usable if r[1] * block >= 65536]
+            print(f"    runs >= 64 KB: {len(big)}, "
+                  f"totalling {sum(n for _, n in big) * block} bytes")
+            print("    largest usable:")
+            for b, n in sorted(usable, key=lambda r: -r[1])[:8]:
+                where = "after the MFT" if b * block >= ar.mft_offset else "before"
+                print(f"      0x{b*block:012X}  {n:>7} blocks  "
+                      f"{n*block:>11} bytes  ({where})")
+            erased = free_rows(ar)
+            reserved = [r for r in free_rows(ar, include_reserved=True)
+                        if r < FIRST_CLAIMABLE_ROW]
+            print(f"\nerased MFT rows (size 0): "
+                  f"{len(erased)} claimable, {len(reserved)} reserved")
+            if erased:
+                print(f"  claimable: {erased[:12]}"
+                      f"{' ...' if len(erased) > 12 else ''}")
+            if reserved:
+                print(f"  reserved (rows < {FIRST_CLAIMABLE_ROW}, never used by "
+                      f"the client): {reserved}")
+            tbl = ar.row(FILE_ID_TABLE_ROW)
+            spare = blocks_for(tbl.size, block) * block - tbl.size
+            print(f"\nfile-id table: {tbl.size // 8} pairs, {spare} bytes spare "
+                  f"in its reservation = {spare // 8} more pairs in place")
+            if not (args.insert or args.overwrite):
+                return 0
+
+        if args.insert:
+            plan_insert(ar, args.insert, file_id=args.file_id,
+                        classified=classified).show(block)
+        if args.overwrite:
+            row = args.overwrite
+            size = args.new_size
+            if size is None:
+                # `row <= ar.entry_count` was one too loose: `entry_count`
+                # COUNTS the descriptor, so the highest real row is one less and
+                # the top of the range raised IndexError out of a bound that had
+                # just said the row was fine. `Archive.row` owns the bound.
+                try:
+                    size = ar.row(row).size
+                except (IndexError, TypeError):
+                    size = 0
+            plan_overwrite(ar, row, size).show(block)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
