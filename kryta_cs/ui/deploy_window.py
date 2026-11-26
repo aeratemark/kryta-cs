@@ -23,7 +23,7 @@ STEPS = [
     ("build", "Build", "Assemble the map file and borrow the donor's look (reads Gw.dat, writes nothing)"),
     ("backup", "Back up Gw.dat", "A whole copy beside it, once, before the first write"),
     ("install", "Install into Gw.dat", "A new file id of its own, or an update of the one this map already has"),
-    ("publish", "Publish into the world pack", "config/World/<pack>/maps/Custom/<id>/, read when the world starts"),
+    ("publish", "Publish into the world pack", "config/World/<pack>/maps/Custom/<id>/ and the map's NPCs, read when the world starts"),
     ("point", "Point the control panel at this archive",
      "manage.json MapArchiveFile, so the panel can add the map's walk graph to data/path-graphs.bin"),
 ]

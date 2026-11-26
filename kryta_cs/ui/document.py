@@ -13,12 +13,15 @@ class Document(QObject):
     project_changed = Signal()        # a different project (new / open)
     heights_changed = Signal(object)  # dirty rect (x0, y0, x1, y1) or None for all
     textures_changed = Signal(object)  # per-cell texture rect (x0,y0,x1,y1) or None
+    flora_changed = Signal()          # the flora brush layer (kryta_cs/flora.py)
     spawns_changed = Signal()
     props_changed = Signal()          # placed donor models changed
     settings_changed = Signal()       # name, ids, flags...
     analysis_changed = Signal()       # slopes / classes / findings recomputed
     selection_changed = Signal(int)   # spawn index or -1
     prop_selection_changed = Signal(int)  # placed prop index or -1
+    npcs_changed = Signal()           # placed NPCs changed (MapProject.npcs)
+    npc_selection_changed = Signal(int)  # placed NPC index or -1
     status = Signal(str)
 
     def __init__(self):
@@ -32,6 +35,7 @@ class Document(QObject):
         self.reach = set()
         self.selected = -1
         self.selected_prop = -1
+        self.selected_npc = -1
         self.dirty = False
         self.undo.cleanChanged.connect(lambda clean: setattr(self, "dirty", not clean))
 
@@ -42,10 +46,12 @@ class Document(QObject):
         self.undo.clear()
         self.selected = 0 if project.spawns else -1
         self.selected_prop = -1
+        self.selected_npc = -1
         self.analyse()
         self.project_changed.emit()
         self.selection_changed.emit(self.selected)
         self.prop_selection_changed.emit(-1)
+        self.npc_selection_changed.emit(-1)
         self.undo.setClean()
 
     def analyse(self):
@@ -64,8 +70,8 @@ class Document(QObject):
 
     def _texture_findings(self, p) -> list:
         """Cells where four textures meet: the client asserts on them."""
-        if not self.tile_types or not p.tiles:
-            return []
+        if not self.tile_types or not p.tiles or getattr(p, "stock", False):
+            return []                   # a game map's textures are ArenaNet's and are not rebuilt
         bad = texlayers.overflow_cells(p.tiles, p.dim_x, p.dim_y, self.tile_types)
         out = []
         for gx, gy, n in bad:
@@ -81,6 +87,7 @@ class Document(QObject):
         if idx >= 0:
             self.selected_prop = -1
             self.prop_selection_changed.emit(-1)
+            self._drop_npc()
         self.selection_changed.emit(idx)
 
     def select_prop(self, idx: int):
@@ -88,7 +95,24 @@ class Document(QObject):
         if idx >= 0:
             self.selected = -1
             self.selection_changed.emit(-1)
+            self._drop_npc()
         self.prop_selection_changed.emit(idx)
+
+    def select_npc(self, idx: int):
+        self.selected_npc = idx
+        if idx >= 0:
+            if self.selected >= 0:
+                self.selected = -1
+                self.selection_changed.emit(-1)
+            if self.selected_prop >= 0:
+                self.selected_prop = -1
+                self.prop_selection_changed.emit(-1)
+        self.npc_selection_changed.emit(idx)
+
+    def _drop_npc(self):
+        if self.selected_npc >= 0:
+            self.selected_npc = -1
+            self.npc_selection_changed.emit(-1)
 
     def touch_settings(self):
         self.analyse()
@@ -161,6 +185,30 @@ class TilesCommand(QUndoCommand):
         self._put(self.before)
 
 
+class FloraCommand(QUndoCommand):
+    """One flora edit: the flora types, the per-cell flora layer and the outlined areas
+    (MapProject.flora, a game map's own) before and after."""
+
+    def __init__(self, doc: Document, before: tuple, after: tuple, text: str):
+        super().__init__(text)
+        self.doc = doc
+        self.before = _flora_state(before)
+        self.after = _flora_state(after)
+
+    def _put(self, src):
+        self.doc.project.flora_names = list(src[0])
+        self.doc.project.flora_layer = list(src[1])
+        if src[2] is not None:
+            self.doc.project.flora = _copy_areas(src[2])
+        self.doc.flora_changed.emit()
+
+    def redo(self):
+        self._put(self.after)
+
+    def undo(self):
+        self._put(self.before)
+
+
 class PropsCommand(QUndoCommand):
     """Place, move or delete placed donor models."""
 
@@ -206,12 +254,52 @@ class SettingCommand(QUndoCommand):
         return False
 
 
+class NpcsCommand(QUndoCommand):
+    """Place, move, turn, edit or delete placed NPCs: the whole list before and after."""
+
+    def __init__(self, doc: Document, before: list, after: list, text: str):
+        super().__init__(text)
+        self.doc = doc
+        self.before = [n.copy() for n in before]
+        self.after = [n.copy() for n in after]
+
+    def _put(self, src):
+        self.doc.project.npcs = [n.copy() for n in src]
+        if self.doc.selected_npc >= len(src):
+            self.doc.select_npc(-1)
+        self.doc.npcs_changed.emit()
+
+    def redo(self):
+        self._put(self.after)
+
+    def undo(self):
+        self._put(self.before)
+
+
+def copy_npcs(p: MapProject) -> list:
+    return [n.copy() for n in (p.npcs or [])]
+
+
 def copy_heights(p: MapProject) -> list:
     return [row[:] for row in p.heights]
 
 
 def copy_spawns(p: MapProject) -> list:
     return [Spawn(s.x, s.y, s.angle) for s in p.spawns]
+
+
+def _copy_areas(areas) -> list:
+    from ..model import FloraArea
+    return [FloraArea(a.type, list(a.points), a.type_id, a.flags) for a in areas]
+
+
+def _flora_state(t: tuple) -> tuple:
+    return (list(t[0]), list(t[1]), _copy_areas(t[2]) if len(t) > 2 and t[2] is not None else None)
+
+
+def copy_flora(p: MapProject) -> tuple:
+    return (list(p.flora_names), list(p.flora_layer or [0] * (p.dim_x * p.dim_y)),
+            _copy_areas(p.flora or []))
 
 
 def copy_tiles(p: MapProject) -> list:

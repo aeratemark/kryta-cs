@@ -108,6 +108,10 @@ class Finding:
 def validate(p: MapProject) -> list:
     """Everything that would make the build refuse, or the client mesh nothing."""
     out = []
+    if getattr(p, "stock", False):
+        # A game map's ground, seed and mesh are ArenaNet's and are not rebuilt (kryta_cs/stock.py).
+        return [Finding(Finding.INFO, "This is a game map: its ground is shown as it ships and is "
+                                      "not rebuilt. Its props, flora and NPCs are what you edit.")]
     if not p.spawns:
         out.append(Finding(Finding.ERROR, "The map has no spawn point. Use Character > Place Spawn Point."))
     slopes = slope_map(p)

@@ -85,6 +85,31 @@ class ModelAsset:
 
 
 @dataclass
+class FloraInfo:
+    """One of the donor's flora types, as the flora brush lists it (kryta_cs/zones.py)."""
+    name: str            # short name, `LakesideWheat`
+    groups: int
+    plants: int          # plant models
+    areas: int           # outlines the donor itself gives it
+
+
+def donor_flora(stripped) -> list:
+    """The donor map's flora types, from its Stripped Zones part; [] when it has none."""
+    from . import zones
+    c = stripped.find(zones.STRIPPED_ZONES)
+    if c is None:
+        return []
+    try:
+        z = zones.Zones.decode(c.payload())
+    except zones.ZonesError:
+        return []
+    used = {}
+    for a in z.areas:
+        used[a.type_id] = used.get(a.type_id, 0) + 1
+    return [FloraInfo(t.short_name, len(t.counts), t.model_count, used.get(t.id, 0)) for t in z.types]
+
+
+@dataclass
 class DonorAssets:
     archive: str
     donor_file_id: int
@@ -95,6 +120,7 @@ class DonorAssets:
     table_a: bytes = b""
     table_b: bytes = b""
     donor_tiles: bytes = b""
+    flora: list = field(default_factory=list)     # [FloraInfo]: the donor's flora types (Zones part)
     notes: list = field(default_factory=list)
 
     def texture(self, tile: int = 0):
@@ -298,7 +324,8 @@ def load_donor_assets(dat: str, donor_file_id: int, log=None, textures_cb=None,
         result = DonorAssets(archive=os.path.abspath(dat), donor_file_id=int(donor_file_id),
                              donor_row=int(row), textures=[], models=[],
                              tex_word=int(donor.tex_word), table_a=bytes(donor.table_a),
-                             table_b=bytes(donor.table_b), donor_tiles=bytes(trn.tiles))
+                             table_b=bytes(donor.table_b), donor_tiles=bytes(trn.tiles),
+                             flora=donor_flora(donor.stripped))
         # The base texture is what the untouched build uses for every cell; decode
         # that first and let the window show it while the rest of the table is read.
         if n:

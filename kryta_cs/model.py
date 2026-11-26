@@ -134,13 +134,88 @@ class PlacedProp:
     outline: list = field(default_factory=list)
     model: int = 0
     grid_locked: bool = True
+    src: int | None = None      # a game map's prop: its index in the map's own props (kryta_cs/stock.py)
 
     def to_json(self):
-        return {"file_id": "0x%X" % int(self.file_id), "model": int(self.model),
-                "x": round(self.x, 2), "y": round(self.y, 2), "z": round(self.z, 2),
-                "rot": [int(v) for v in self.rot], "scale": int(self.scale),
-                "flags": int(self.flags), "grid_locked": bool(self.grid_locked),
-                "outline": [[int(a), int(b)] for a, b in self.outline]}
+        # A game map's prop keeps its position exactly, so a build that changed nothing writes
+        # the map's own bytes back; an authored one is rounded to keep the file readable.
+        keep = (lambda v: float(v)) if self.src is not None else (lambda v: round(v, 2))
+        d = {"file_id": "0x%X" % int(self.file_id), "model": int(self.model),
+             "x": keep(self.x), "y": keep(self.y), "z": keep(self.z),
+             "rot": [int(v) for v in self.rot], "scale": int(self.scale),
+             "flags": int(self.flags), "grid_locked": bool(self.grid_locked),
+             "outline": [[int(a), int(b)] for a, b in self.outline]}
+        if self.src is not None:
+            d["src"] = int(self.src)
+        return d
+
+
+@dataclass
+class PlacedNpc:
+    """One NPC put on the map: a row of the world pack's `npcs/placements/<map id>.json`.
+
+    `definition` is the NPC type, a row id of `npcs/definitions.json`; x and y are world
+    units, as the map's spawns are. `angle` is the facing in radians (None faces +x).
+    `name` is the literal name the client shows (None: the definition's own, which the pack
+    keeps as encoded string ids); dialogs/*.lua finds its NPC by that name. `level` overrides the
+    definition's; `behavior` names an entry of npcs/behaviors.lua. `extra` keeps every other
+    field of the row as read, so nothing the world knows is lost by a round trip."""
+    id: str
+    definition: str
+    x: float
+    y: float
+    angle: float | None = None
+    name: str | None = None
+    level: int | None = None
+    behavior: str | None = None
+    extra: dict = field(default_factory=dict)
+
+    def to_json(self):
+        d = {"id": self.id, "definition": self.definition,
+             "x": round(float(self.x), 6), "y": round(float(self.y), 6)}
+        for key in ("angle", "name", "level", "behavior"):
+            if getattr(self, key) is not None:
+                d[key] = getattr(self, key)
+        if self.extra:
+            d["extra"] = dict(self.extra)
+        return d
+
+    @classmethod
+    def from_json(cls, d: dict) -> "PlacedNpc":
+        angle = d.get("angle")
+        level = d.get("level")
+        return cls(id=str(d["id"]), definition=str(d["definition"]),
+                   x=float(d["x"]), y=float(d["y"]),
+                   angle=None if angle is None else float(angle),
+                   name=None if d.get("name") is None else str(d["name"]),
+                   level=None if level is None else int(level),
+                   behavior=None if d.get("behavior") is None else str(d["behavior"]),
+                   extra=dict(d.get("extra") or {}))
+
+    def copy(self) -> "PlacedNpc":
+        return PlacedNpc(self.id, self.definition, self.x, self.y, self.angle, self.name,
+                         self.level, self.behavior, json.loads(json.dumps(self.extra)))
+
+
+@dataclass
+class FloraArea:
+    """Where one flora type grows: an outline in world units, as the map's Zones part stores it.
+
+    `type` names one of the donor's flora types by its short name (`LakesideWheat`); the build
+    takes that type's settings and plant models from the donor and writes this outline for it
+    (kryta_cs/zones.py). The client grows the plants inside the outline itself."""
+    type: str
+    points: list = field(default_factory=list)     # [(x, y), ...] world units, at least 3
+    type_id: int | None = None   # a game map's area: the map's own type id (names can repeat)
+    flags: str = ""              # a game map's area: its three flag bytes, hex ("" = 00 00 80)
+
+    def to_json(self):
+        d = {"type": self.type, "points": [[float(x), float(y)] for x, y in self.points]}
+        if self.type_id is not None:
+            d["type_id"] = int(self.type_id)
+        if self.flags:
+            d["flags"] = self.flags
+        return d
 
 
 @dataclass
@@ -170,6 +245,16 @@ class MapProject:
     prop_outline: int = 0
     reserve_bytes: int = 16384
     notes: str = ""
+    flora: list = field(default_factory=list)       # [FloraArea]: hand-typed flora outlines
+    flora_names: list = field(default_factory=list) # the flora brush's types, by donor short name
+    flora_layer: list = field(default_factory=list) # per cell: 0 none, k = flora_names[k-1] (kryta_cs/flora.py)
+    npcs: list = field(default_factory=list)        # [PlacedNpc]: npcs/placements/<map id>.json on publish
+    # A GAME MAP opened from Gw.dat (kryta_cs/stock.py): its own file id is `file_id`, the terrain
+    # is shown and never rebuilt, and the build patches only its props and flora into it.
+    stock: bool = False
+    origin: list = field(default_factory=lambda: [0.0, 0.0])  # the map's world corner (x0, y0):
+    #                                               game coordinates = editor coordinates + origin
+    npc_file: dict | None = None                    # a game map's placements file minus its rows
     path: str | None = field(default=None, repr=False, compare=False)
 
     # --------------------------------------------------------------- creation
@@ -281,6 +366,10 @@ class MapProject:
         d.pop("path", None)
         d["spawns"] = [s.to_json() for s in self.spawns]
         d["props"] = [p.to_json() for p in self.props]
+        d["flora"] = [f.to_json() for f in self.flora]
+        d["npcs"] = [n.to_json() for n in self.npcs]
+        if not any(self.flora_layer):
+            d["flora_layer"] = []                   # nothing painted: keep the file small
         d["heights"] = [[_compact(v) for v in row] for row in self.heights]
         d["format"] = "kryta-cs-map/1"
         for key in ("file_id", "donor_file_id", "constants_file_id", "map_flags"):
@@ -298,6 +387,8 @@ class MapProject:
                 d[key] = int(v, 0)
         spawns = [Spawn(float(s["x"]), float(s["y"]), s.get("angle")) for s in d.pop("spawns", [])]
         props_raw = d.pop("props", [])
+        flora_raw = d.pop("flora", [])
+        npcs_raw = d.pop("npcs", [])
         seed = d.pop("seed", None)
         tiles = d.pop("tiles", None)
         known = {f for f in cls.__dataclass_fields__}
@@ -316,11 +407,33 @@ class MapProject:
                                     x=float(q["x"]), y=float(q["y"]), z=float(q["z"]),
                                     rot=rot, scale=int(q.get("scale", 0x7F)),
                                     flags=int(q.get("flags", 0)), outline=outline,
-                                    grid_locked=bool(q.get("grid_locked", True))))
+                                    grid_locked=bool(q.get("grid_locked", True)),
+                                    src=None if q.get("src") is None else int(q["src"])))
         p.props = props
+        p.flora = [FloraArea(str(f["type"]), [(float(x), float(y)) for x, y in f.get("points", [])],
+                             None if f.get("type_id") is None else int(f["type_id"]),
+                             str(f.get("flags", "")))
+                   for f in flora_raw]
+        p.origin = [float(v) for v in (p.origin or [0.0, 0.0])][:2]
+        if len(p.origin) != 2:
+            raise ValueError("a map's origin is two numbers")
+        p.flora_names = [str(n) for n in (p.flora_names or [])]
+        layer = [int(v) for v in (p.flora_layer or [])]
+        if layer and len(layer) != p.dim_x * p.dim_y:
+            raise ValueError(f"the flora layer has {len(layer)} cells; the map has {p.dim_x * p.dim_y}")
+        if any(v < 0 or v > len(p.flora_names) for v in layer):
+            raise ValueError("the flora layer names a flora type the project does not list")
+        p.flora_layer = layer
+        p.npcs = [PlacedNpc.from_json(n) for n in npcs_raw]
+        ids = [n.id for n in p.npcs]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two placed NPCs share an id")
         p.seed = tuple(seed) if seed else None
         p.heights = [[float(v) for v in row] for row in p.heights]
-        check_dims(p.dim_x, p.dim_y)
+        if p.stock:
+            check_stock_dims(p.dim_x, p.dim_y)
+        else:
+            check_dims(p.dim_x, p.dim_y)
         if len(p.heights) != p.dim_y or any(len(r) != p.dim_x for r in p.heights):
             raise ValueError("the height field does not match dim_x x dim_y")
         cells = p.dim_x * p.dim_y
@@ -369,6 +482,13 @@ def check_dims(dim_x: int, dim_y: int) -> None:
     for d in (dim_x, dim_y):
         if d < TILE or d > MAX_DIM or d % TILE:
             raise ValueError(f"a side must be a multiple of {TILE} from {TILE} to {MAX_DIM}, got {d}")
+
+
+def check_stock_dims(dim_x: int, dim_y: int) -> None:
+    """A game map is the size ArenaNet made it: whole 32-cell tiles, of any count."""
+    for d in (dim_x, dim_y):
+        if d < TILE or d % TILE:
+            raise ValueError(f"a game map's side is whole 32-cell tiles, got {d}")
 
 
 def angle_to_degrees(angle):

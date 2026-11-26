@@ -109,6 +109,118 @@ The screen is laid out the way the Morrowind Construction Set laid it out:
   the configured `Gw.dat`; stitched worlds are cached under
   `~/.kryta_cs/worldmap-cache/`.
 
+## Flora (the Flora tool, G)
+
+Guild Wars grows its ground cover - wheat, grass, flowers, ferns, shrubs - itself, inside flora
+areas a map file carries (its Zones part; `kryta_cs/zones.py` reads and writes it). Each area
+names a flora TYPE the map also carries: groups of small plant models with sizes, densities and
+pick weights, named after ArenaNet's setup file (`LakesideWheat`, `EdenHillsShrubs`). They are not
+props and not part of a texture; that is why pre-Searing's grass is patchy.
+
+The flora brush paints those areas. Object Window > Flora lists the donor's flora types
+(pre-Searing, 0x1B97D, has eight); pick one and the Flora tool arms. In the Render Window, left drag
+paints where it grows, right drag clears; the edit radius is the brush's (Ctrl+wheel), and every
+stroke is one undo. Painted flora shows as a see-through colour per type; the Flora tab's checkbox
+hides it.
+
+The build turns the painted cells into rectangles and writes the map's own Zones part: the
+donor's flora types and plant models (the Zones Dependencies list) exactly as the donor has them,
+and your areas. A type you did not paint has no area, so nothing of it grows. The types are kept
+whole because the Zones part's record 2 points into the plant list; a build that dropped unused
+types crashed the client on load (`Assertion: def`, ZnModel.cpp). The client grows the plants when
+it compiles the map, so what you see in game is the game's own scatter, not a copy of the editor's
+colour. A map with no painted flora builds as before.
+
+## Game maps (File > Open Game Map)
+
+Opens one of the world pack's maps as it ships in Gw.dat: its ground and textures to look at, its
+props, flora areas and NPCs to edit. Pick it from the list (map id, name, kind, map file); maps
+that share a map file are named there, because editing the file's props or flora changes all of
+them (pre-Searing's file is both Lakeside County and Ascalon City). NPCs are per map id.
+
+- Props: the map's own, selected, moved, turned and deleted as any prop; new ones come from the
+  map's own model list in the Models tab.
+- Flora: the map's own areas are drawn as outlines with the Flora tool's overlay; right-click
+  inside one to remove it, and paint new ones with the map's own flora types.
+- NPCs: the pack's `npcs/placements/<map id>.json`, every row's other fields, its routes and its
+  note kept as they are. A row that faces by a `direction` keeps it until you turn the NPC.
+- The ground is not reshaped: the Sculpt tool is off for a game map, and its id, type, water,
+  mesh flags and donor are fixed.
+
+Build & Deploy patches the map's own file: the props part and its model list, and the flora part,
+everything else carried byte for byte (kryta_cs/stock.py). Every build starts from the map as it
+shipped: the copy the editor keeps in `kryta-maps/` from just before it first writes the map, else
+the `Gw.dat.kryta-original` backup, else Gw.dat. So a build that changed nothing writes the map's
+own bytes back, and Restore Gw.dat undoes it. Gw.dat has a map's file only once the official client
+downloaded it; a map it lacks cannot be opened. Publish writes the map's NPC file in place (git
+undoes that). `tools/game_map_check.bat` opens and rebuilds real maps from your Gw.dat without
+writing anything, to confirm each comes back byte for byte.
+
+## NPCs (Object Window > NPCs, Universe > NPCs)
+
+The NPCs tab lists the world pack's NPC types (`npcs/definitions.json`) over the NPCs placed on
+this map. Drag a type into the Render Window to place one; in Select mode click an NPC to select
+it, drag to move it, Alt-drag to turn it, Delete to remove it, and double-click (here or in the
+list) for its record: type, name, position, facing, level and behavior (an entry of
+`npcs/behaviors.lua`). Every change is one undo.
+
+An NPC is drawn as its own model, read from Gw.dat with the prop models and standing in its rest
+pose, turned to its facing and sized by its type's scale; a ring at its feet is green when it is
+friendly and red when hostile. A character's model file is only its skeleton: its meshes are the
+type's body files (`model_files`), and a type without body files carries its mesh in the model
+file itself. A type whose mesh cannot be read (5 of the Vanilla pack's 120) is drawn as a post.
+Armour dyes and held weapons are not drawn.
+
+The pack stores a type's name as encoded game text, which the editor cannot read, so a type is
+shown by the readable name some placement in the pack gives it (`Duke Barradin`), by its id
+(`Bandit Raider`), or as its profession and level. The Name field of a placed NPC is the name the
+client shows over it, and the one a dialog in `dialogs/*.lua` finds it by.
+
+The NPCs are saved in the map project. Publish writes them as the world pack's
+`npcs/placements/<map id>.json`; when the pack has its own file for that id, Publish moves it to
+`kryta-cs-displaced/npcs/placements/` and taking the map off the world moves it back. Publish
+refuses a map whose NPCs the world would refuse (a type or behavior not in the pack). Restart the
+world to see them. Patrol routes are not edited here yet.
+
+## Scripts (Gameplay > Edit Scripts, Ctrl+E)
+
+Kryta's content is Lua, and the Construction Set edits it where it lives: the pack's own `.lua`
+files. Nothing is copied into a project or kept anywhere else; Save writes the file.
+
+The Script Edit window lists every Lua file the world reads, by what the world does with it:
+
+- **Runtime**: `scripts/runtime.lua`, which runs every dialog (`docs/decisions/0019`).
+- **Dialogs**: `dialogs/<npc>.lua`, one per NPC (`dialogs/README.md`). **New Dialog** (Ctrl+N) makes
+  one in the README's shape.
+- **Behaviors**: `npcs/behaviors.lua`, the NPC behaviour trees and scripts.
+- **Skills**: every `skills/*.lua` a `skills.json` row names (`skills/README.md`); a script no row
+  names is listed with a warning, because the world never reads it.
+
+The text is highlighted (the pack's own names `gw`, `mix`, `PLAYER`, `ctx`, `cast` and `op` picked
+out), with line numbers; Tab and Shift+Tab indent four spaces, Ctrl+/ comments lines, Ctrl+F finds,
+Ctrl+G goes to a line. Several files can be changed at once; each keeps its own undo history, and the
+list marks unsaved files with `*`.
+
+**Check** (F7, this file) and **Check All** (Shift+F7) find what the world would refuse at start-up:
+
+1. Syntax, always, as you type: the line and column of the first error, in Lua's own words.
+2. With `lupa` installed (it is in `requirements.txt`), the world's own load: each kind run in a Lua
+   5.4 state opened as `game/src/Scripting/` opens it (only `table`, `string`, `math` and the base
+   functions; no `load`, `loadfile` or `dofile`; a million instructions per call), then the world's
+   checks: the runtime's `check()` and every text converted as `NpcScripts::text_units` converts it
+   for the dialogs, `parse_spec` for the behaviours, an `on_use` function for every skill.
+
+A problem names its file and line: double-click it. Unsaved text is checked in place of the file, so a
+dialog can be checked against a runtime change not yet saved. Save asks before writing a file with a
+syntax error, or one that changed on disk since it was opened. The world reads the pack once, at
+start-up: restart it after saving.
+
+From a terminal: `python -m kryta_cs.lua.check [pack]` runs Check All and exits 1 on an error.
+
+The reader behind this (`kryta_cs/lua/source.py`) parses all of Lua 5.4 in plain Python and keeps
+every position, so a later window can show a dialog's pages as a form and change one value by
+replacing exactly its characters: comments, order, layout and hand-written functions stay as written.
+
 ## Build & Deploy (F5)
 
 1. **Check** the map (the Problems list, errors stop here).
@@ -168,6 +280,14 @@ can come back; publishing again moves it aside again.
     kryta_cs/pipeline.py     build / backup / install / verify through Rurik's toolkit
     kryta_cs/assets.py       the donor's terrain textures and prop models, read from Gw.dat
     kryta_cs/kryta.py        the Kryta checkout: map pack catalogue, /tp slots, pack publish, manager settings
+    kryta_cs/zones.py        a map's Zones part (flora types and areas): read, write, round-trip
+    kryta_cs/flora.py        the flora brush's layer: painting cells, the rectangles a build writes
+    kryta_cs/stock.py        game maps: open one from Gw.dat, build it back as a patch of its own file
+    kryta_cs/npcs.py         the pack's NPC types and a map's placed NPCs as npcs/placements/<id>.json
+    kryta_cs/lua/            the pack's Lua, without Qt:
+      source.py              Lua 5.4 read with positions kept: syntax errors, tables as data, exact edits
+      pack.py                which Lua files the world reads, by kind; reading and writing them
+      check.py               Check: syntax, then the world's own load through lupa
     kryta_cs/ui/             the PySide6 window
       theme.py               the classic and dark themes
       icons.py               the 16x16 toolbar icons, drawn in code
@@ -178,7 +298,8 @@ can come back; publishing again moves it aside again.
       heightmap_view.py      the Top View
       render_window.py       the Render Window frame and the 3D/Top switch
       cell_view.py           the Cell View: tiles and their objects
-      object_window.py       the Object Window: spawns, maps, terrain, textures, models, props
+      object_window.py       the Object Window: spawns, maps, terrain, textures, flora, models, props, NPCs
+      npc_dialog.py           a placed NPC's reference data (type, name, xy, facing, level, behavior)
       model_preview.py        the model properties preview, textured
       model_properties.py     the Models record dialog (measurements and preview)
       prop_properties.py      a placed prop's reference data (placement, xyz, yaw, scale)
@@ -186,6 +307,8 @@ can come back; publishing again moves it aside again.
       terrain_texture.py      the client's base+overlay terrain blend
       panels.py              Landscape Edit Settings, Map Properties, Problems, Messages
       main_window.py         the window, menus, toolbar and dock layout
+      script_window.py       Gameplay > Edit Scripts: the pack's Lua files, Check, Save
+      lua_editor.py          the script text box: highlighting, line numbers, problem lines
     third_party/rurik/       Rurik's toolkit, verbatim (see third_party/NOTICE.md)
     tests/                   offline tests: python -m pytest tests
 
@@ -193,5 +316,16 @@ can come back; publishing again moves it aside again.
 
 - Dragging a prop's yaw and scale directly in the Render Window; the Reference
   Data dialog edits both today.
-- NPC spawns as a second object type beside the spawn points.
+- A Dialogue window over `dialogs/*.lua`: pages and choices as a form, written back through
+  `lua/source.py`'s exact edits, with a panel that runs a talk through the runtime for a test
+  character.
+- Patrol routes for placed NPCs: waypoints drawn and dragged in the Render Window, written as the
+  placements file's `routes`.
 - Doorways (`map_arch`) between custom maps.
+
+## License
+
+The Kryta Construction Set is released under the MIT License; see `LICENSE`. The Rurik toolkit
+copied under `third_party/rurik/` keeps its own MIT license (`third_party/rurik/LICENSE`, see
+`third_party/NOTICE.md`). Guild Wars and its game files belong to ArenaNet: none are part of this
+repository, and the tools that read your own Gw.dat write their output to git-ignored folders.

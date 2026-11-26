@@ -10,7 +10,8 @@ around the selected object (or turn in place with nothing selected); middle
 drag or Space + mouse move pans; the wheel zooms toward the point under the mouse; the arrow keys move the view, Shift+Up/Down raises and lowers it;
 F fits the map. Shift or Alt + middle drag still orbits the point under the mouse. Landscape editing: left drag applies the brush at
 the point under the cursor, right drag paints the donor texture selected in the
-Object Window, Ctrl+wheel sizes the brush. Spawns and placed models: left
+Object Window, Ctrl+wheel sizes the brush. Flora tool (G): left drag paints the flora type
+selected in Object Window > Flora, right drag clears flora. Spawns and placed models: left
 selects and drags, double-click opens a model's properties, right-click (Select
 tool) removes it, Delete removes the selected one. Shift+left also orbits."""
 
@@ -25,11 +26,13 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QLinearGradient, QPain
                            QPixmap, QPolygonF, QTransform)
 from PySide6.QtWidgets import QWidget
 
-from .. import terrain, texlayers
+from .. import flora, terrain, texlayers
+from ..npcs import npc_rotation, npc_scale_byte
 from ..model import CELL, Spawn, prop_apply, prop_matrix
-from .document import (HeightsCommand, PropsCommand, SpawnsCommand, TilesCommand, copy_heights,
-                       copy_props, copy_spawns, copy_tiles)
-from .heightmap_view import SCULPT, SELECT, SPAWN, ramp
+from .document import (FloraCommand, HeightsCommand, NpcsCommand, PropsCommand, SpawnsCommand,
+                       TilesCommand, copy_flora, copy_heights, copy_npcs, copy_props, copy_spawns,
+                       copy_tiles)
+from .heightmap_view import FLORA, SCULPT, SELECT, SPAWN, ramp
 from .images import qimage
 from .theme import COLORS
 from .uvmap import affine
@@ -40,6 +43,19 @@ LOD_TRI_BUDGET = 700        # triangles a placed model may draw, however far you
 TEXTURED_FRAME_BUDGET = 200 # textured (per-triangle) draws a whole frame may make
 LIGHT = (0.45, 0.48, 0.75)  # z-up: the light mostly comes from above
 MARKER_PX = 260.0
+NPC_MIME = "application/x-kryta-npc"   # object_window.NpcTypeTable
+
+
+class NpcFigure:
+    """One mesh of a placed NPC, shaped like a PlacedProp so the prop renderers draw it.
+
+    Never in `self.props`: the prop list stays what the map's prop chunk holds, so selecting,
+    moving and deleting a prop never sees an NPC. `npc` is the NPC's index in MapProject.npcs."""
+    __slots__ = ("file_id", "x", "y", "z", "rot", "scale", "npc")
+
+    def __init__(self, file_id, x, y, z, rot, scale, npc):
+        self.file_id, self.x, self.y, self.z = file_id, x, y, z
+        self.rot, self.scale, self.npc = rot, scale, npc
 FOV = math.radians(60.0)        # the CS's render window is a perspective view
 NEAR = 0.05                     # grid units; a point closer than this is clipped
 
@@ -116,6 +132,8 @@ class _View3DCore:
         self.show_cells = True
         self.textures = []
         self.paint_tile = 0
+        self.flora_type = None          # the flora brush's type (Object Window > Flora)
+        self.show_flora = True
         self.use_texture = True
         self.fast_texture = True
         self.show_radius = True
@@ -137,11 +155,16 @@ class _View3DCore:
         self._drag = None
         self._stroke_before = None
         self._tile_before = None
+        self._flora_before = None
+        self._flora_erase = False
         self._last_dab = None
         self._spawns_before = None
         self._drag_spawn = None
         self._prop_drag = None
         self._prop_rot = None
+        self._npc_drag = None        # (index, NPCs before, turning)
+        self.npc_hostile = set()     # NPC type ids drawn red (object_window.NpcsPage)
+        self.npc_bodies = {}         # NPC type id -> (mesh file ids, scale): what draws it
         self._space = False
         self._look_last = None       # Shift + mouse move: the CS's camera rotation
         self._pan_last = None        # Space + mouse move: the CS's pan
@@ -493,6 +516,13 @@ class _View3DCore:
     def set_paint_texture(self, tile: int):
         self.paint_tile = max(0, int(tile))
 
+    def set_flora_type(self, name):
+        self.flora_type = name or None
+
+    def set_show_flora(self, on: bool):
+        self.show_flora = bool(on)
+        self.update()
+
     # the software painter draws a pre-blended albedo image; the OpenGL view
     # blends on the GPU from the layer table and does not need one
     needs_ground_image = True
@@ -736,7 +766,7 @@ class _View3DCore:
                round(self.base_dist, 3),
                round(self.exag, 6), self._mesh_version, self.show_wireframe,
                self.use_texture, len(self.textures), self._props_version,
-               getattr(p, "water_level", None), self.doc.selected_prop)
+               getattr(p, "water_level", None), self.doc.selected_prop, self._npc_key())
         if key != self._cache_key:
             pm = self._buffer()
             pm.fill(Qt.transparent)
@@ -758,14 +788,16 @@ class _View3DCore:
         if self.show_cells:
             self._paint_cell_borders(qp, cam)
         self._paint_border(qp, cam)
+        self._paint_flora(qp, cam)
         self._paint_spawns(qp, cam)
+        self._paint_npcs(qp, cam)
         self._paint_cursor(qp, cam)
 
     def _paint_placed_models(self, qp, cam, only=None):
         """The placed models, batched by shade so a building is a few fills, not
         a few thousand. `only` restricts the pass to a set of prop indices, so
         the water can sit between the models under it and the ones above."""
-        if not self.props:
+        if not self.props and not getattr(self.doc.project, "npcs", None):
             return
         self._paint_props(qp, cam, only)
 
@@ -938,7 +970,8 @@ class _View3DCore:
         placed buildings interactive. A triangle that is large on screen still
         gets its own texture, so the model you are looking at stays textured."""
         p = self.doc.project
-        if p is None or not self.props:
+        drawn = self._drawn_models()
+        if p is None or not drawn:
             return
         col_cache = {}
         selected_box = None
@@ -951,13 +984,13 @@ class _View3DCore:
         focus = self.doc.selected_prop
         if not (0 <= focus < len(self.props)):
             best = 1e18
-            for i, q in enumerate(self.props):
+            for i, q in enumerate(drawn):
                 _pt, d = self._project(p.world_to_cell(q.x, q.y)[0],
                                        p.world_to_cell(q.x, q.y)[1], q.z, cam)
                 if d < best:
                     best, focus = d, i
         tex_left = TEXTURED_FRAME_BUDGET
-        for prop_index, q in enumerate(self.props):
+        for prop_index, q in enumerate(drawn):
             if only is not None and prop_index not in only:
                 continue
             meshes = self.prop_mesh.get(q.file_id)
@@ -969,7 +1002,7 @@ class _View3DCore:
             mly = r1 * lx + r4 * ly - r7 * lz
             mlz = r2 * lx + r5 * ly - r8 * lz
             scale = (q.scale * (255.0 / 128.0) / 256.0) + (1.0 / 128.0)
-            sel = prop_index == self.doc.selected_prop
+            sel = prop_index == self.doc.selected_prop and prop_index < len(self.props)
             box = None
             buckets = {}
             textured = []
@@ -1193,6 +1226,129 @@ class _View3DCore:
             qp.setPen(QColor("#101010"))
             qp.drawText(QRectF(top.x() + 6, top.y() - 9, 26, 16), Qt.AlignVCenter | Qt.AlignLeft, str(i))
 
+    def set_npc_hostile(self, type_ids):
+        self.npc_hostile = set(type_ids)
+        self.update()
+
+    def set_npc_bodies(self, bodies):
+        self.npc_bodies = dict(bodies)
+        self._invalidate_cache()
+        self.update()
+
+    def npc_mesh_ids(self) -> set:
+        """The mesh files the map's placed NPCs need (main_window loads them as prop models)."""
+        p = self.doc.project
+        out = set()
+        for n in (p.npcs if p is not None else []):
+            out.update(self.npc_bodies.get(n.definition, ((), 1.0))[0])
+        return out
+
+    def _npc_meshes(self, n):
+        """(mesh file ids, scale) when every mesh of the NPC is loaded, else None (a post)."""
+        got = self.npc_bodies.get(n.definition)
+        if not got or not got[0]:
+            return None
+        if any(fid not in self.prop_mesh for fid in got[0]):
+            return None
+        return got
+
+    def _npc_figures(self) -> list:
+        p = self.doc.project
+        out = []
+        for i, n in enumerate(p.npcs if p is not None else []):
+            got = self._npc_meshes(n)
+            if got is None:
+                continue
+            z = p.height_at_world(n.x, n.y)
+            rot = npc_rotation(n.angle)
+            sb = npc_scale_byte(got[1])
+            for fid in got[0]:
+                out.append(NpcFigure(fid, n.x, n.y, z, rot, sb, i))
+        return out
+
+    def _drawn_models(self) -> list:
+        """The props, then the NPC figures: what the renderers draw as models."""
+        return list(self.props) + self._npc_figures()
+
+    def _npc_key(self):
+        p = self.doc.project
+        if p is None:
+            return ()
+        return (tuple((n.definition, round(n.x, 1), round(n.y, 1), n.angle) for n in p.npcs),
+                self.doc.selected_npc, id(self.npc_bodies))
+
+    def _npc_height(self, n) -> float:
+        got = self._npc_meshes(n)
+        if got is None:
+            return MARKER_PX * 0.7
+        h = max((m["height"] for fid in got[0] for m in self.prop_mesh.get(fid, [])), default=72.0)
+        return max(30.0, h * got[1])
+
+    def _npc_points(self, i, cam):
+        p = self.doc.project
+        n = p.npcs[i]
+        gx, gy = p.world_to_cell(n.x, n.y)
+        z = p.height_at_world(n.x, n.y)
+        base, _d = self._project(gx, gy, z, cam)
+        top, _d = self._project(gx, gy, z + self._npc_height(n) + 8.0, cam)
+        return base, top, gx, gy, z
+
+    def _paint_npcs(self, qp, cam):
+        """Placed NPCs: a post with a diamond head, green friendly, red hostile, and a facing line."""
+        p = self.doc.project
+        if p is None or not getattr(p, "npcs", None):
+            return
+        font = QFont(self.font())
+        font.setPointSize(max(7, self.font().pointSize() - 1))
+        qp.setFont(font)
+        for i, n in enumerate(p.npcs):
+            base, top, gx, gy, z = self._npc_points(i, cam)
+            if self._project(gx, gy, z, cam)[1] <= NEAR * 2:
+                continue                    # behind the camera
+            sel = i == self.doc.selected_npc
+            col = QColor("#d04040") if n.definition in self.npc_hostile else QColor("#40c060")
+            figure = self._npc_meshes(n) is not None
+            if figure:
+                # the model is drawn with the props: mark only its feet, coloured by side
+                r = 7.0 if sel else 4.0
+                qp.setBrush(Qt.NoBrush)
+                qp.setPen(QPen(QColor("#ffffff") if sel else col, 2 if sel else 1.5))
+                qp.drawEllipse(base, r * 1.6, r * 0.7)
+            else:
+                qp.setPen(QPen(QColor("#ffffff") if sel else col.darker(150), 3 if sel else 1.5))
+                qp.drawLine(base, top)
+                r = 5.5 if sel else 4.5
+                head = QPolygonF([QPointF(top.x(), top.y() - r), QPointF(top.x() + r, top.y()),
+                                  QPointF(top.x(), top.y() + r), QPointF(top.x() - r, top.y())])
+                qp.setBrush(col)
+                qp.setPen(QPen(QColor("#ffffff") if sel else QColor("#101010"), 2 if sel else 1))
+                qp.drawPolygon(head)
+            if n.angle is not None and (sel or not figure):
+                ex, ey = gx + math.cos(n.angle) * 1.6, gy - math.sin(n.angle) * 1.6
+                tip, _d = self._project(ex, ey, _bilinear(p, ex, ey) + 30, cam)
+                qp.setPen(QPen(col, 2))
+                qp.drawLine(base, tip)
+            if n.name or sel:
+                qp.setPen(QColor("#ffffff") if sel else QColor("#101010"))
+                qp.drawText(QRectF(top.x() + 7, top.y() - 9, 220, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                            n.name or n.id)
+
+    def _npc_at(self, pos) -> int:
+        p = self.doc.project
+        if p is None or not getattr(p, "npcs", None):
+            return -1
+        cam = self._camera()
+        best, bd = -1, 1e9
+        for i in range(len(p.npcs)):
+            base, top, gx, gy, z = self._npc_points(i, cam)
+            if self._project(gx, gy, z, cam)[1] <= NEAR * 2:
+                continue
+            d = min(math.hypot(base.x() - pos.x(), base.y() - pos.y()),
+                    math.hypot(top.x() - pos.x(), top.y() - pos.y()))
+            if d < bd:
+                best, bd = i, d
+        return best if bd <= 12.0 else -1
+
     def _paint_cursor(self, qp, cam):
         p = self.doc.project
         if self._mouse is None:
@@ -1203,7 +1359,7 @@ class _View3DCore:
         gx, gy, z = pick
         self._pick = pick
         c, _d = self._project(gx, gy, z, cam)
-        if self.tool != SCULPT:
+        if self.tool not in (SCULPT, FLORA):
             qp.setPen(QPen(QColor("#ffffff"), 2))
             qp.drawLine(QPointF(c.x() - 6, c.y()), QPointF(c.x() + 6, c.y()))
             qp.drawLine(QPointF(c.x(), c.y() - 6), QPointF(c.x(), c.y() + 6))
@@ -1351,6 +1507,97 @@ class _View3DCore:
             self.doc.textures_changed.emit((x0, y0, x1, y1))
         self.update()
 
+    def _flora_dab(self, pos):
+        """Paint the flora type under the brush, or clear flora on a right drag."""
+        p = self.doc.project
+        pick = self._pick_terrain(pos)
+        if p is None or pick is None:
+            return
+        gx, gy, _z = pick
+        r = self.brush.radius
+        x0, x1 = max(0, int(gx - r)), min(p.dim_x - 1, int(gx + r) + 1)
+        y0, y1 = max(0, int(gy - r)), min(p.dim_y - 1, int(gy + r) + 1)
+        points = [(x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)
+                  if self.brush.weight(math.hypot(x - gx, y - gy)) > 0]
+        changed = flora.paint(p, points, None if self._flora_erase else self.flora_type)
+        self._last_dab = pos
+        if changed:
+            self.doc.flora_changed.emit()
+        self.update()
+
+    def _flora_area_at(self, pos) -> int:
+        """The outlined flora area under the cursor (the last drawn wins), or -1."""
+        p = self.doc.project
+        pick = self._pick_terrain(pos)
+        if p is None or pick is None or not p.flora:
+            return -1
+        x, y = self._world_at(pick[0], pick[1])
+        for i in range(len(p.flora) - 1, -1, -1):
+            pts = p.flora[i].points
+            inside = False
+            for (ax, ay), (bx, by) in zip(pts, pts[1:] + pts[:1]):
+                if (ay > y) != (by > y) and x < ax + (y - ay) * (bx - ax) / ((by - ay) or 1e-9):
+                    inside = not inside
+            if inside:
+                return i
+        return -1
+
+    def _paint_flora_areas(self, qp, cam):
+        """Outlined flora areas (a game map's own) as see-through polygons on the ground."""
+        p = self.doc.project
+        if not self.show_flora or not p.flora:
+            return
+        names = list(p.flora_names)
+        for a in p.flora:
+            if a.type not in names:
+                names.append(a.type)
+            col = flora.color(names.index(a.type))
+            pts = []
+            for x, y in a.points:
+                gx, gy = p.world_to_cell(x, y)
+                pt, depth = self._project(gx, gy, _bilinear(p, gx, gy) + 6, cam)
+                if depth <= NEAR * 2:
+                    pts = []
+                    break
+                pts.append(pt)
+            if len(pts) < 3:
+                continue
+            qp.setBrush(QColor(*col, 60))
+            qp.setPen(QPen(QColor(*col, 220), 1.5))
+            qp.drawPolygon(QPolygonF(pts))
+            qp.setPen(QColor(*col, 255))
+            qp.drawText(pts[0] + QPointF(4, -4), a.type)
+
+    def _paint_flora(self, qp, cam):
+        """Painted flora as a see-through colour per type, one quad per cell."""
+        p = self.doc.project
+        if self.show_flora and p is not None and p.flora:
+            self._paint_flora_areas(qp, cam)
+        if not self.show_flora or not p.flora_layer or not any(p.flora_layer):
+            return
+        if len(p.flora_layer) != p.dim_x * p.dim_y:
+            return
+        qp.setPen(Qt.NoPen)
+        brushes = [QColor(*flora.color(i), 105) for i in range(len(p.flora_names))]
+        dx = p.dim_x
+        for i, v in enumerate(p.flora_layer):
+            if not v or v > len(brushes):
+                continue
+            gx, gy = i % dx, i // dx
+            pts = []
+            behind = False
+            for cx, cy in ((gx - 0.5, gy - 0.5), (gx + 0.5, gy - 0.5),
+                           (gx + 0.5, gy + 0.5), (gx - 0.5, gy + 0.5)):
+                pt, depth = self._project(cx, cy, _bilinear(p, cx, cy) + 4, cam)
+                if depth <= NEAR * 2:
+                    behind = True
+                    break
+                pts.append(pt)
+            if behind:
+                continue
+            qp.setBrush(brushes[v - 1])
+            qp.drawPolygon(QPolygonF(pts))
+
     def _report(self, pos):
         p = self.doc.project
         if p is None:
@@ -1396,6 +1643,12 @@ class _View3DCore:
         # Placed models are only selected, moved and turned in Select mode, so a
         # sculpt or texture stroke that starts on a building edits the ground.
         if self.tool == SELECT and ev.button() == Qt.LeftButton:
+            hit = self._npc_at(pos)
+            if hit >= 0:
+                self.doc.select_npc(hit)
+                self._npc_drag = (hit, copy_npcs(p), bool(ev.modifiers() & Qt.AltModifier))
+                self.setCursor(Qt.SizeAllCursor)
+                return
             hit = self._prop_at(pos)
             if hit >= 0:
                 self.doc.select_prop(hit)
@@ -1425,6 +1678,27 @@ class _View3DCore:
             self._last_dab = None
             self._dab(pos)
             return
+        if self.tool == FLORA and ev.button() in (Qt.LeftButton, Qt.RightButton):
+            if self._pick_terrain(pos) is None:
+                return
+            erase = ev.button() == Qt.RightButton
+            if erase:
+                hit = self._flora_area_at(pos)
+                if hit >= 0:                    # an outlined area (a game map's own): remove it
+                    before = copy_flora(p)
+                    after = copy_flora(p)
+                    gone = after[2].pop(hit)
+                    self.doc.undo.push(FloraCommand(self.doc, before, after,
+                                                    f"Remove {gone.type} area"))
+                    return
+            if not erase and not self.flora_type:
+                self.doc.status.emit("Pick a flora type first: Object Window > Flora.")
+                return
+            self._flora_before = copy_flora(p)
+            self._flora_erase = erase
+            self._last_dab = None
+            self._flora_dab(pos)
+            return
         if self.tool in (SPAWN, SELECT) and ev.button() == Qt.LeftButton:
             hit = self._spawn_at(pos)
             if hit >= 0:
@@ -1444,6 +1718,7 @@ class _View3DCore:
                 self.doc.select(-1)
                 if self.tool == SELECT:
                     self.doc.select_prop(-1)
+                    self.doc.select_npc(-1)
             return
         if self.tool == SPAWN and ev.button() == Qt.RightButton:
             hit = self._spawn_at(pos)
@@ -1513,6 +1788,23 @@ class _View3DCore:
                 self._invalidate_cache()
                 self.update()
             return
+        if self._npc_drag is not None and ev.buttons() & Qt.LeftButton:
+            idx, _before, turning = self._npc_drag
+            pick = self._pick_terrain(pos)
+            if pick is not None and 0 <= idx < len(p.npcs):
+                n = p.npcs[idx]
+                x, y = self._world_at(pick[0], pick[1])
+                if turning or ev.modifiers() & Qt.AltModifier:
+                    if math.hypot(x - n.x, y - n.y) > 1.0:
+                        n.angle = math.atan2(y - n.y, x - n.x)
+                else:
+                    wx, wy = p.world_size()
+                    n.x = min(max(x, 0.0), wx - 1)
+                    n.y = min(max(y, 0.0), wy - 1)
+                self._invalidate_cache()
+                self._report(pos)
+                self.update()
+            return
         if self._prop_drag is not None and ev.buttons() & Qt.LeftButton:
             idx, _before = self._prop_drag
             pick = self._pick_terrain(pos)
@@ -1529,6 +1821,14 @@ class _View3DCore:
                 self._invalidate_cache()
                 self._report(pos)
                 self.update()
+            return
+        if self._flora_before is not None and ev.buttons() & (Qt.LeftButton | Qt.RightButton):
+            step = max(2.0, self.brush.radius * self._camera()[2] * 0.25)
+            if self._last_dab is None or math.hypot(pos.x() - self._last_dab.x(),
+                                                    pos.y() - self._last_dab.y()) >= step:
+                self._flora_dab(pos)
+            self._report(pos)
+            self.update()
             return
         if self._tile_before is not None and ev.buttons() & Qt.RightButton:
             step = max(2.0, self.brush.radius * self._camera()[2] * 0.25)
@@ -1580,6 +1880,18 @@ class _View3DCore:
                 p.props = before
                 self.doc.undo.push(PropsCommand(self.doc, before, after, "Rotate prop"))
             return
+        if self._npc_drag is not None and p is not None:
+            _idx, before, _turning = self._npc_drag
+            self._npc_drag = None
+            self.setCursor(Qt.CrossCursor if self.tool != SELECT else Qt.ArrowCursor)
+            after = copy_npcs(p)
+            changed = [(a.x, a.y, a.angle) != (b.x, b.y, b.angle) for a, b in zip(after, before)]
+            if any(changed):
+                turned = any(a.angle != b.angle for a, b in zip(after, before))
+                p.npcs = before
+                self.doc.undo.push(NpcsCommand(self.doc, before, after,
+                                               "Turn NPC" if turned else "Move NPC"))
+            return
         if self._prop_drag is not None and p is not None:
             idx, before = self._prop_drag
             self._prop_drag = None
@@ -1590,6 +1902,19 @@ class _View3DCore:
             if moved:
                 p.props = before
                 self.doc.undo.push(PropsCommand(self.doc, before, after, "Move prop"))
+            return
+        if self._flora_before is not None and p is not None:
+            after = copy_flora(p)
+            before = self._flora_before
+            self._flora_before = None
+            self._last_dab = None
+            if after != before:
+                # FloraCommand's redo puts `after` back, so the live stroke is undone first
+                p.flora_names, p.flora_layer = list(before[0]), list(before[1])
+                if len(before) > 2 and before[2] is not None:
+                    p.flora = list(before[2])
+                self.doc.undo.push(FloraCommand(self.doc, before, after,
+                                                "Clear flora" if self._flora_erase else "Paint flora"))
             return
         if self._tile_before is not None and p is not None:
             after = copy_tiles(p)
@@ -1622,6 +1947,12 @@ class _View3DCore:
 
     def mouseDoubleClickEvent(self, ev):
         if self.doc.project is None or ev.button() != Qt.LeftButton or self.tool != SELECT:
+            return
+        hit = self._npc_at(ev.position())
+        if hit >= 0:
+            self._npc_drag = None
+            self.doc.select_npc(hit)
+            self.npc_activated.emit(hit)
             return
         hit = self._prop_at(ev.position())
         if hit >= 0:
@@ -1700,6 +2031,15 @@ class _View3DCore:
                 self._pan_last = None
                 self.setCursor(Qt.OpenHandCursor)
         elif (ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.tool == SELECT
+              and self.doc.selected_npc >= 0):
+            p = self.doc.project
+            i = self.doc.selected_npc
+            if p is not None and 0 <= i < len(p.npcs):
+                before = copy_npcs(p)
+                after = [n for k, n in enumerate(before) if k != i]
+                self.doc.undo.push(NpcsCommand(self.doc, before, after, f"Delete {before[i].id}"))
+                self.doc.select_npc(-1)
+        elif (ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.tool == SELECT
               and self.doc.selected_prop >= 0):
             p = self.doc.project
             i = self.doc.selected_prop
@@ -1732,15 +2072,29 @@ class _View3DCore:
         self.update()
 
     def dragEnterEvent(self, ev):
-        if ev.mimeData().hasFormat("application/x-kryta-model"):
+        md = ev.mimeData()
+        if md.hasFormat("application/x-kryta-model") or md.hasFormat(NPC_MIME):
             ev.acceptProposedAction()
 
     def dragMoveEvent(self, ev):
-        if ev.mimeData().hasFormat("application/x-kryta-model"):
+        md = ev.mimeData()
+        if md.hasFormat("application/x-kryta-model") or md.hasFormat(NPC_MIME):
             ev.acceptProposedAction()
 
     def dropEvent(self, ev):
         md = ev.mimeData()
+        if md.hasFormat(NPC_MIME):
+            try:
+                data = json.loads(bytes(md.data(NPC_MIME)).decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            pick = self._pick_terrain(ev.position())
+            if pick is None or not data.get("definition"):
+                return
+            x, y = self._world_at(pick[0], pick[1])
+            self.npc_dropped.emit({"definition": str(data["definition"]), "x": x, "y": y})
+            ev.acceptProposedAction()
+            return
         if not md.hasFormat("application/x-kryta-model"):
             return
         try:
@@ -1773,6 +2127,8 @@ class SoftTerrain3DView(_View3DCore, QWidget):
     tool_requested = Signal(str)
     model_dropped = Signal(object)
     prop_activated = Signal(int)
+    npc_dropped = Signal(object)
+    npc_activated = Signal(int)
 
     def __init__(self, doc, brush, parent=None):
         QWidget.__init__(self, parent)

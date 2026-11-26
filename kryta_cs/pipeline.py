@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 
 from . import paths
 from . import texlayers
+from . import flora as flora_mod
+from . import zones as zones_mod
 from .model import FILE_ID_SEARCH_START, MapProject, _tiled_index
 
 paths.bootstrap_rurik()
@@ -419,6 +421,78 @@ def _apply_authored_props(blob: bytes, placed, donor_model_ids, log) -> bytes:
     return mf.encode()
 
 
+def _clockwise(points: list) -> list:
+    """The outline wound clockwise, as every one of pre-Searing's 72 flora areas is."""
+    pts = [(float(x), float(y)) for x, y in points]
+    twice_area = sum(pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
+                     for i in range(len(pts)))
+    return pts[::-1] if twice_area > 0 else pts
+
+
+def _apply_flora(blob: bytes, areas, donor_stripped, log) -> bytes:
+    """Write the map's Zones part: the donor's flora types, as the donor has them, and our areas.
+
+    The assembled map carries the constants donor's empty Zones part (34 bytes: no flora). The
+    biome donor's own Zones part holds its flora types and its Zones Dependencies list holds
+    their plant models, every type's models in type order (kryta_cs/zones.py). Both are carried
+    over UNCHANGED - every type, the plant list byte for byte and record 2 - and only the areas
+    are ours. A type no area names simply grows nothing.
+
+    Why unchanged: record 2 numbers positions in the plant list (each is the first appearance of
+    a distinct model). A build that kept only the types it used shortened the list, and the client
+    stopped on load at `Assertion: def`, ZnModel.cpp(86), both with the donor's record 2 (it then
+    points past the shorter list) and with an empty one (2026-11-24).
+    The client grows the plants itself when it compiles the map."""
+    if not areas:
+        return blob
+    zc = donor_stripped.find(zones_mod.STRIPPED_ZONES)
+    dc = donor_stripped.find(zones_mod.STRIPPED_ZONES_DEPS)
+    if zc is None or dc is None:
+        raise PipelineError("the donor map has no flora (no Zones part or no plant list), so its "
+                            "flora types cannot be used; remove the flora areas or change the donor")
+    donor_zones = zones_mod.Zones.decode(zc.payload())
+    dep_payload = dc.payload()
+    donor_deps = list(mapchunks.decode_dependencies(dep_payload).file_ids)
+    if len(donor_deps) != donor_zones.model_count():
+        raise PipelineError(f"the donor's flora types hold {donor_zones.model_count()} plant models "
+                            f"and its plant list has {len(donor_deps)}; they should agree")
+    by_name = {t.short_name.lower(): t for t in donor_zones.types}
+    used = []
+    out_areas = []
+    for a in areas:
+        t = by_name.get(str(a.type).lower())
+        if t is None:
+            raise PipelineError(f"flora type {a.type!r} is not one of the donor's: "
+                                + ", ".join(x.short_name for x in donor_zones.types))
+        if len(a.points) < 3:
+            raise PipelineError(f"a {a.type} area has {len(a.points)} point(s); it needs 3 or more")
+        if t not in used:
+            used.append(t)
+        out_areas.append(zones_mod.Area(t.id, _clockwise(a.points)))
+    z = zones_mod.Zones(types=donor_zones.types, areas=out_areas, record2=donor_zones.record2,
+                        version=donor_zones.version, order=donor_zones.order)
+    payload = z.encode()
+    zones_mod.Zones.decode(payload)                       # refuse our own bytes if they do not read
+    mf = mapfile.MapFile.decode(blob)
+    own = mf.find(zones_mod.STRIPPED_ZONES)
+    if own is None:
+        raise PipelineError("the assembled map has no Zones part to replace")
+    idx = mf.chunks.index(own)
+    mf.chunks[idx] = mapfile.Chunk(own.chunk_id, payload, mapfile.FORM_OPAQUE)
+    old = mf.find(zones_mod.STRIPPED_ZONES_DEPS)
+    if old is not None:
+        mf.chunks[mf.chunks.index(old)] = mapfile.Chunk(old.chunk_id, dep_payload, mapfile.FORM_OPAQUE)
+    else:
+        # Right after Zones, as retail carries each Dependencies list after its chunk; Zones (and
+        # so this) stays before Terrain, whose compile reads the zones (stripbuild.py ORDER).
+        mf.chunks.insert(idx + 1, mapfile.Chunk(zones_mod.STRIPPED_ZONES_DEPS, dep_payload,
+                                                mapfile.FORM_OPAQUE))
+    log(f"flora: {len(out_areas)} area(s) of {len(used)} type(s) "
+        f"({', '.join(t.short_name for t in used)}); the donor's {len(donor_zones.types)} types and "
+        f"{len(donor_deps)} plant models kept as they are, {len(payload):,} B Zones part")
+    return mf.encode()
+
+
 def _apply_water_level(blob: bytes, level, log) -> bytes:
     """Set the water plane's height in the borrowed environment chunk.
 
@@ -460,10 +534,24 @@ def _apply_water_level(blob: bytes, level, log) -> bytes:
     return mf.encode()
 
 
+def _build_stock(project: MapProject, dat: str, log) -> BuildResult:
+    """A game map: its own file with the editor's props and flora (kryta_cs/stock.py)."""
+    from . import stock
+    try:
+        blob, notes = stock.build(project, dat, log)
+    except stock.StockError as exc:
+        raise PipelineError(str(exc)) from exc
+    stream, compression, size_note = install_bytes(blob)
+    log(size_note)
+    return BuildResult(blob, stream, compression, [], 0.0, notes + [size_note], 0, len(blob))
+
+
 def build(project: MapProject, dat: str, log=None) -> BuildResult:
     """Steps 1-4. Reads the archive (for the donor) and writes nothing."""
     log = log or (lambda s: None)
     check_archive(dat)
+    if getattr(project, "stock", False):
+        return _build_stock(project, dat, log)
     _ensure_constants_donor(project, dat, log)
     area = project.rurik_area()
     if project.props:
@@ -490,6 +578,9 @@ def build(project: MapProject, dat: str, log=None) -> BuildResult:
             if getattr(project, "tiles", None):
                 report.blob = _apply_texture_tiles(report.blob, project.tiles, print)
             report.blob = _apply_water_level(report.blob, project.water_level, print)
+            areas = flora_mod.all_areas(project)
+            if areas:
+                report.blob = _apply_flora(report.blob, areas, donor.stripped, print)
             stream, compression, size_note = install_bytes(report.blob)
             print(size_note)
             notes = deploy.verify(report, area, snapped, dx, install_size=len(stream),
@@ -506,6 +597,8 @@ def build(project: MapProject, dat: str, log=None) -> BuildResult:
 
 def apply_snap(project: MapProject, result: BuildResult) -> None:
     """Put the lattice-snapped heights back in the project, so the editor shows what ships."""
+    if getattr(project, "stock", False) or not result.snapped:
+        return                              # a game map's ground is its own and is not rebuilt
     project.from_rurik_heights(result.snapped)
 
 
@@ -529,6 +622,8 @@ def install(project: MapProject, dat: str, log=None) -> InstallResult:
     here = work_dir(dat)
     tag = tag_of(project)
 
+    if getattr(project, "stock", False):
+        return _install_stock(project, dat, log)
     if project.file_id is None:
         with Archive(dat) as ar:
             project.file_id = datalloc.next_free_file_id(ar, FILE_ID_SEARCH_START)
@@ -573,6 +668,66 @@ def install(project: MapProject, dat: str, log=None) -> InstallResult:
                     raise PipelineError(f"arming the head was refused (rc {proc.returncode})")
                 armed = True
             print("the head is empty, so the client compiles the walkable mesh when it loads this map")
+    except Refused as exc:
+        raise PipelineError(str(exc)) from exc
+    except SystemExit as exc:
+        raise PipelineError(str(exc)) from exc
+    return InstallResult(file_id, head_row, partner_row, verb, armed, staged)
+
+
+def _arm(dat: str, file_id: int, here: str, tag: str) -> None:
+    """Empty the map's Bloated head, so the client compiles the map from the stream we wrote."""
+    rebloat = os.path.join(paths.RURIK_MAPDATA, "rebloat.py")
+    cmd = [_python(), rebloat, "--dat", dat, "--file-id", hex(file_id), "--arm",
+           "--confirm", "--baseline", os.path.join(here, f"{tag}_baseline.json"),
+           "--journal", os.path.join(here, f"{tag}_rebloat.json")]
+    proc = subprocess.run(cmd, capture_output=True, text=True,
+                          env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    for line in (proc.stdout + proc.stderr).splitlines():
+        print(line)
+    if proc.returncode != 0:
+        raise PipelineError(f"arming the head was refused (rc {proc.returncode})")
+
+
+def _install_stock(project: MapProject, dat: str, log) -> InstallResult:
+    """A game map: replace (or relocate) ArenaNet's own Stripped row for its file id.
+
+    Rurik's displaced-retail-row path (deploy.install_partner, created=False): fit in the row,
+    or relocate, never grow into blocks the row was not given. The whole archive was backed up
+    before the first write (ensure_backup), and that backup is also every later build's base."""
+    if not os.path.isfile(backup_path(dat)):
+        raise PipelineError("a game map is only written once Gw.dat is backed up (run the Back up "
+                            "step): Restore Gw.dat is how its patch is undone")
+    from . import stock
+    here = work_dir(dat)
+    tag = tag_of(project)
+    file_id = int(project.file_id)
+    try:
+        saved = stock.save_original(dat, file_id)    # before the first write: every later base
+    except stock.StockError as exc:
+        raise PipelineError(str(exc)) from exc
+    log(f"the map's untouched file is kept at {saved}")
+    result = build(project, dat, log)
+    staged = staged_map_path(project, dat)
+    with open(staged, "wb") as fh:
+        fh.write(result.blob)
+    try:
+        with _captured(log):
+            with Archive(dat) as ar:
+                rows, create = deploy.resolve_or_create(ar, file_id, False, here=here, tag=tag)
+            if create or rows is None:
+                raise PipelineError(f"map file 0x{file_id:X} is not in this archive")
+            head_row, partner_row, reservation = rows
+            print(f"writing game map file 0x{file_id:X}: head {head_row}, partner {partner_row}")
+            verb = deploy.install_partner(
+                dat, staged, result.blob, result.stream, result.compression, head_row,
+                partner_row, reservation, tag, reserve=0, created=False)
+            print(f"the partner row was written by {verb}")
+            armed = deploy.head_is_armed(dat, head_row)
+            if not armed:
+                _arm(dat, file_id, here, tag)
+                armed = True
+            print("the head is empty, so the client compiles the map when it next loads it")
     except Refused as exc:
         raise PipelineError(str(exc)) from exc
     except SystemExit as exc:

@@ -75,9 +75,10 @@ class _SliderRow(QWidget):
 # ====================================================================== brushes
 
 class BrushPanel(QWidget):
-    tool_chosen = Signal(str)          # "sculpt", "select"
+    tool_chosen = Signal(str)          # "sculpt", "select", "flora"
     closed = Signal()
     choose_texture = Signal()
+    choose_flora = Signal()
     show_radius = Signal(bool)
 
     TOOL_LABELS = [("raise", "Raise"), ("lower", "Lower"), ("smooth", "Smooth"), ("flatten", "Flatten"),
@@ -96,7 +97,9 @@ class BrushPanel(QWidget):
         ml.setSpacing(3)
         self.mode_group = QButtonGroup(self)
         for key, text, tip in (("sculpt", "Sculpt", "Paint the terrain with the brush (S)"),
-                               ("select", "Select", "Pick, move and turn props and spawn points (V)")):
+                               ("select", "Select", "Pick, move and turn props and spawn points (V)"),
+                               ("flora", "Flora", "Paint where the donor's flora grows: left drag "
+                                                  "paints, right drag clears (G)")):
             b = QToolButton()
             b.setText(text)
             b.setToolTip(tip)
@@ -184,11 +187,25 @@ class BrushPanel(QWidget):
         choose.clicked.connect(self.choose_texture.emit)
         tl.addWidget(choose)
         lay.addWidget(tex)
-        lay.addWidget(_label("Left drag sculpts. Right drag paints the selected texture.", muted=True))
+        fl = QGroupBox("Flora")
+        fll = QVBoxLayout(fl)
+        fll.setSpacing(2)
+        self.flora_label = _label("Selected: none (Object Window > Flora)", muted=True)
+        fll.addWidget(self.flora_label)
+        choose_fl = QPushButton("Choose Flora...")
+        choose_fl.clicked.connect(self.choose_flora.emit)
+        fll.addWidget(choose_fl)
+        lay.addWidget(fl)
+        lay.addWidget(_label("Sculpt: left drag sculpts, right drag paints the selected texture. "
+                             "Flora: left drag paints the selected flora, right drag clears it; "
+                             "the edit radius is the brush's.", muted=True))
         lay.addStretch(1)
 
     def set_texture(self, tile):
         self.texture_label.setText(f"Selected: tile {tile} (Object Window > Textures)")
+
+    def set_flora(self, name):
+        self.flora_label.setText(f"Selected: {name or 'none'} (Object Window > Flora)")
 
     def _set_tool(self, key):
         self.brush.tool = key
@@ -366,6 +383,16 @@ class MapPanel(QWidget):
         self.outline.setValue(p.prop_outline)
         if self.notes.toPlainText() != p.notes:
             self.notes.setPlainText(p.notes)
+        if getattr(p, "stock", False):
+            # A game map's id, type, file, mesh flags, water and look are ArenaNet's own.
+            for w in (self.map_id, self.map_type, self.water_has, self.water_level, self.cut45,
+                      self.water, self.donor, self.constants, self.trees, self.outline):
+                w.setEnabled(False)
+            self.file_id.setText(f"0x{p.file_id:X} ({p.file_id}), the game's own map file")
+        else:
+            for w in (self.map_id, self.map_type, self.water_has, self.cut45, self.water,
+                      self.donor, self.constants, self.trees, self.outline):
+                w.setEnabled(True)
         self._loading = False
 
     def _set(self, attr, value, text):

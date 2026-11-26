@@ -16,6 +16,8 @@ Publishing a custom map therefore:
     editor's own note of what it did), and
   - moves the pack's own folder for that id, if there is one, out of `maps/` to
     `<pack>/kryta-cs-displaced/<its path under maps>/`, so the id is not stated twice.
+  - writes the map's placed NPCs as `<pack>/npcs/placements/<map id>.json`, setting the pack's
+    own file for that id aside under `<pack>/kryta-cs-displaced/npcs/placements/` (kryta_cs/npcs.py).
 Taking the map off the world reverses both. Nothing is deleted from the pack: the
 displaced folder is moved back exactly as it was.
 
@@ -38,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import npcs as npcs_mod
 from .model import MapProject
 
 WORLD_CONFIG = os.path.join("worldserver", "worldserver.json")
@@ -351,10 +354,21 @@ def publish(repo: str, project: MapProject) -> str:
     -> the folder written. If the pack has its own folder for this id it is moved aside
     (see the module docstring), and the record it held is the base of the new basic.json.
     """
+    if getattr(project, "stock", False):
+        # A game map is the pack's own: its folder stays, and only its NPC file is written.
+        if not os.path.isdir(pack_dir(repo)):
+            raise ValueError(f"no world pack at {pack_dir(repo)}; is WorldPack in worldserver.json right?")
+        npcs_mod.publish_stock(pack_dir(repo), project)
+        return npcs_mod.placement_path(pack_dir(repo), project.map_id)
     if project.file_id is None:
         raise ValueError("the map has no file id yet; install it into Gw.dat first")
     if not os.path.isdir(maps_dir(repo)):
         raise ValueError(f"no world pack at {maps_dir(repo)}; is WorldPack in worldserver.json right?")
+    if project.npcs:
+        problems = npcs_mod.check(pack_dir(repo), project)
+        if problems:                          # refused before anything is moved or written
+            raise ValueError("the map's NPCs would stop the world from starting:\n  "
+                             + "\n  ".join(problems))
     mid = int(project.map_id)
     folder = custom_folder(repo, mid)
     marker = _marker(folder) or {}
@@ -384,15 +398,19 @@ def publish(repo: str, project: MapProject) -> str:
     portals = os.path.join(folder, "portals.json")
     if os.path.exists(portals):
         os.remove(portals)                    # a custom map has no doorways yet
+    npc_state = npcs_mod.publish(pack_dir(repo), project, marker)
     _write_json(os.path.join(folder, MARKER), {
         "note": "Written by the Kryta Construction Set. 'displaced' is the pack folder this map stands in "
-                "for, kept under kryta-cs-displaced/ until the map is taken off the world.",
+                "for, kept under kryta-cs-displaced/ until the map is taken off the world. "
+                "'npcs_written' says npcs/placements/<map id>.json is the editor's; 'npcs_displaced', "
+                "that the pack's own file for the id waits under kryta-cs-displaced/npcs/.",
         "map_id": mid,
         "slug": project.slug,
         "state": "published",
         "published": stamp,
         "project": project.path or None,
         "displaced": displaced,
+        **npc_state,
     })
     _remove_legacy_sql(repo, project.slug)
     return folder
@@ -403,11 +421,15 @@ def unpublish(repo: str, project: MapProject) -> str:
 
     -> a short description of what was done.
     """
+    if getattr(project, "stock", False):
+        return ("a game map is the pack's own, so there is nothing to take off: its NPC file "
+                f"(npcs/placements/{int(project.map_id)}.json) is undone with git, and its map "
+                f"file with Restore Gw.dat")
     mid = int(project.map_id)
     folder = custom_folder(repo, mid)
     marker = _marker(folder) or {}
     displaced = marker.get("displaced")
-    done = []
+    done = npcs_mod.unpublish(pack_dir(repo), mid, marker)
     if os.path.isdir(folder):
         shutil.rmtree(folder)
         _prune_empty(os.path.dirname(folder), maps_dir(repo))

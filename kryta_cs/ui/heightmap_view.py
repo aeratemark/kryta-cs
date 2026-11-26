@@ -38,6 +38,7 @@ def ramp(t: float) -> tuple:
 
 
 SELECT, SCULPT, SPAWN = "select", "sculpt", "spawn"
+FLORA = "flora"      # the flora brush; the Render Window's 3D view paints it (view3d.py)
 
 
 class HeightmapView(QWidget):

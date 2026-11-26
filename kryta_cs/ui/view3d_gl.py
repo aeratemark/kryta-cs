@@ -300,6 +300,8 @@ class GLTerrain3DView(_View3DCore, QOpenGLWidget):
     tool_requested = Signal(str)
     model_dropped = Signal(object)
     prop_activated = Signal(int)
+    npc_dropped = Signal(object)
+    npc_activated = Signal(int)
 
     BUILD_LODS = False              # the GPU draws full meshes; no clustered copies
 
@@ -763,7 +765,9 @@ class GLTerrain3DView(_View3DCore, QOpenGLWidget):
             return
         cam = self._camera()
         qp.setRenderHint(QPainter.Antialiasing, True)
+        self._paint_flora(qp, cam)
         self._paint_spawns(qp, cam)
+        self._paint_npcs(qp, cam)
         self._paint_selected_box(qp, cam)
         self._paint_cursor(qp, cam)
         qp.end()
@@ -852,8 +856,9 @@ class GLTerrain3DView(_View3DCore, QOpenGLWidget):
         f.glDisable(GL_POLYGON_OFFSET_FILL)
 
         # placed models
-        if self.props and self._gpu_props:
-            self._draw_props(p, mvp, light)
+        drawn = self._drawn_models()
+        if drawn and self._gpu_props:
+            self._draw_props(p, mvp, light, drawn)
 
         flat = self._progs["flat"]
         self._sync_borders(p)
@@ -894,7 +899,7 @@ class GLTerrain3DView(_View3DCore, QOpenGLWidget):
             f.glDepthMask(True)
             f.glDisable(GL_BLEND)
 
-    def _draw_props(self, p, mvp, light):
+    def _draw_props(self, p, mvp, light, drawn):
         f = self._gl
         m = self._progs["model"]
         m.prog.bind()
@@ -907,14 +912,17 @@ class GLTerrain3DView(_View3DCore, QOpenGLWidget):
         m.prog.enableAttributeArray(a_pos)
         m.prog.enableAttributeArray(a_uv)
         selected = self.doc.selected_prop
-        for i, q in enumerate(self.props):
+        selected_npc = self.doc.selected_npc
+        n_props = len(self.props)
+        for i, q in enumerate(drawn):
             entry = self._gpu_props.get(q.file_id)
             if entry is None:
                 continue
             model = prop_model(prop_matrix(q.rot), prop_scale(q.scale), q.x, q.y, q.z,
                                p.dim_y, CELL, self.exag)
             m.set("u_model", _matrix(model))
-            m.set("u_tint", SELECT_TINT if i == selected else NO_TINT)
+            picked = (i == selected) if i < n_props else (getattr(q, "npc", -1) == selected_npc)
+            m.set("u_tint", SELECT_TINT if picked else NO_TINT)
             for buf, count, tex, colour in entry[0]:
                 if tex is not None:
                     tex.bind(0)

@@ -14,11 +14,11 @@ import os
 
 from PySide6.QtCore import QMimeData, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel,
-                               QMenu, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QFrame, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QMenu, QPushButton, QSplitter, QTableWidget,
+                               QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
-from .. import paths, terrain
+from .. import flora, npcs as npcs_mod, paths, terrain
 from ..model_names import name_for
 from .model_properties import ModelPropertiesDialog
 from .images import qimage
@@ -286,6 +286,117 @@ class TexturesPage(QWidget):
         tile = int(item.data(Qt.UserRole))
         if self._show_preview(tile):
             self.texture_selected.emit(tile)
+
+
+class FloraPage(QWidget):
+    """The donor's flora types - the ground cover Guild Wars grows itself inside a map's flora areas
+    (kryta_cs/zones.py). Picking one arms the Flora brush (G): left drag paints where it grows, right
+    drag clears. The colour column is the Render Window's overlay colour for the type."""
+
+    flora_selected = Signal(str)
+    show_toggled = Signal(bool)
+
+    def __init__(self, doc, parent=None):
+        super().__init__(parent)
+        self.doc = doc
+        self.assets = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(2)
+        self.note = QLabel("No donor assets loaded.")
+        self.note.setWordWrap(True)
+        self.note.setProperty("muted", True)
+        lay.addWidget(self.note)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Flora type", "Colour", "Plants", "Donor areas", "Painted"])
+        self.table.verticalHeader().setVisible(False)
+        for c in range(5):
+            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._picked)
+        lay.addWidget(self.table, 1)
+        self.show_box = QCheckBox("Show painted flora in the Render Window")
+        self.show_box.setChecked(True)
+        self.show_box.toggled.connect(self.show_toggled.emit)
+        lay.addWidget(self.show_box)
+        self._types = []
+        self._sync = False
+
+    def _colour_of(self, name):
+        p = self.doc.project
+        if p is None:
+            return None
+        for i, n in enumerate(p.flora_names):
+            if n.lower() == name.lower():
+                return QColor(*flora.color(i))
+        return None
+
+    def set_assets(self, assets, error=None):
+        self.assets = assets
+        self._types = list(getattr(assets, "flora", []) or []) if assets is not None else []
+        if error:
+            self.note.setText(error)
+        elif assets is None:
+            self.note.setText("No donor assets loaded. Choose Gw.dat in Build & Deploy, then "
+                              "View > Reload Donor Assets.")
+        elif not self._types:
+            self.note.setText(f"Donor 0x{assets.donor_file_id:X} grows no flora: its map has no flora "
+                              f"types. Choose a donor that does (pre-Searing, 0x1B97D, has eight).")
+        else:
+            self.note.setText(f"Donor 0x{assets.donor_file_id:X}: {len(self._types)} flora type(s). "
+                              f"Pick one, then left-drag in the Render Window to paint where it grows "
+                              f"(Flora tool, G); right-drag clears. The game grows the plants itself.")
+        self.refresh()
+
+    def refresh(self):
+        current = self.selected_name()
+        self._sync = True
+        painted = flora.counts(self.doc.project) if self.doc.project is not None else {}
+        names = [t.name for t in self._types]
+        # flora the project paints with that this donor does not have: still listed, flagged
+        for n in painted:
+            if n.lower() not in {m.lower() for m in names}:
+                names.append(n)
+        self.table.setRowCount(len(names))
+        for i, name in enumerate(names):
+            info = next((t for t in self._types if t.name == name), None)
+            a = QTableWidgetItem(name)
+            a.setData(Qt.UserRole, name)
+            col = self._colour_of(name)
+            b = QTableWidgetItem("" if col is None else "  ")
+            if col is not None:
+                b.setBackground(col)
+            c = QTableWidgetItem("-" if info is None else f"{info.plants} in {info.groups} group(s)")
+            d = QTableWidgetItem("-" if info is None else str(info.areas))
+            e = QTableWidgetItem(f"{painted.get(name, 0):,} cell(s)" if painted.get(name) else "")
+            if info is None:
+                a.setForeground(QColor(COLORS["danger"]))
+                a.setToolTip("This donor has no flora type of that name; the build will refuse it. "
+                             "Clear it with a right drag, or go back to a donor that has it.")
+            for colno, it in enumerate((a, b, c, d, e)):
+                self.table.setItem(i, colno, it)
+        if current is not None:
+            row = next((i for i, n in enumerate(names) if n == current), -1)
+            if row >= 0:
+                self.table.selectRow(row)
+        self._sync = False
+
+    def selected_name(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.table.item(rows[0].row(), 0)
+        return None if item is None else item.data(Qt.UserRole)
+
+    def _picked(self):
+        if self._sync:
+            return
+        name = self.selected_name()
+        if name:
+            self.flora_selected.emit(name)
 
 
 class ModelTable(QTableWidget):
@@ -567,11 +678,273 @@ class PropsPage(QWidget):
         self.table.clearSelection()
 
 
+NPC_MIME = "application/x-kryta-npc"
+
+
+class NpcTypeTable(QTableWidget):
+    """The pack's NPC types; a row drags into the Render Window as a new placed NPC."""
+
+    def __init__(self, rows, cols, parent=None):
+        super().__init__(rows, cols, parent)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setDefaultDropAction(Qt.CopyAction)
+
+    def mimeData(self, items):
+        if not items:
+            return super().mimeData(items)
+        first = self.item(items[0].row(), 0)
+        type_id = first.data(Qt.UserRole) if first is not None else None
+        if not type_id:
+            return super().mimeData(items)
+        md = QMimeData()
+        md.setData(NPC_MIME, json.dumps({"definition": str(type_id)}).encode("ascii"))
+        md.setText(f"npc {type_id}")
+        return md
+
+
+class NpcsPage(QWidget):
+    """The NPC tab: the world pack's NPC types over the NPCs placed on this map.
+
+    Drag a type into the Render Window to place one; double-click a placed NPC (here or in the
+    Render Window) for its record. The map keeps its NPCs; Publish writes them to the world pack's
+    npcs/placements/<map id>.json (kryta_cs/npcs.py)."""
+
+    go_requested = Signal(float, float)
+    edit_requested = Signal(int)
+    types_loaded = Signal()
+
+    def __init__(self, doc, parent=None):
+        super().__init__(parent)
+        self.doc = doc
+        self.pack = None
+        self.pack_source = None      # () -> the pack folder now; asked again on every reload
+        self.types = []
+        self.behaviors = []
+        self._sync = False
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(2)
+        self.note = QLabel("No world pack found.")
+        self.note.setWordWrap(True)
+        self.note.setProperty("muted", True)
+        lay.addWidget(self.note)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter NPC types (name, id, profession, map)")
+        self.filter.setClearButtonEnabled(True)
+        self.filter.textChanged.connect(self._apply_filter)
+        lay.addWidget(self.filter)
+
+        split = QSplitter(Qt.Vertical)
+        self.table = NpcTypeTable(0, 6)
+        self.table.setHorizontalHeaderLabels(["Name", "Type ID", "Profession", "Level", "Team", "Map"])
+        self.table.verticalHeader().setVisible(False)
+        for c in range(6):
+            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        split.addWidget(self.table)
+
+        placed = QWidget()
+        pl = QVBoxLayout(placed)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(2)
+        self.placed_label = QLabel("Placed on this map")
+        pl.addWidget(self.placed_label)
+        self.placed = QTableWidget(0, 5)
+        self.placed.setHorizontalHeaderLabels(["ID", "Name", "Type", "x", "y"])
+        self.placed.verticalHeader().setVisible(False)
+        for c in range(5):
+            self.placed.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.placed.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.placed.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.placed.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.placed.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.placed.itemDoubleClicked.connect(lambda _i: self._properties())
+        self.placed.itemSelectionChanged.connect(self._picked)
+        self.placed.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.placed.customContextMenuRequested.connect(self._menu)
+        pl.addWidget(self.placed, 1)
+        row = QHBoxLayout()
+        row.setSpacing(3)
+        props = QPushButton("Properties...")
+        props.clicked.connect(self._properties)
+        goto = QPushButton("Go To")
+        goto.clicked.connect(self._goto)
+        delete = QPushButton("Delete")
+        delete.clicked.connect(self._delete)
+        reload_ = QPushButton("Reload Types")
+        reload_.setToolTip("Read npcs/definitions.json and npcs/behaviors.lua again")
+        reload_.clicked.connect(self.reload)
+        for b in (props, goto, delete, reload_):
+            row.addWidget(b)
+        pl.addLayout(row)
+        split.addWidget(placed)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        lay.addWidget(split, 1)
+        doc.npcs_changed.connect(self.refresh)
+        doc.project_changed.connect(self.refresh)
+        doc.npc_selection_changed.connect(self._select_row)
+
+    # -- the pack's types
+    def set_pack(self, pack):
+        self.pack = pack
+        self.reload()
+
+    def reload(self):
+        if self.pack_source is not None:
+            self.pack = self.pack_source()
+        self.types, self.behaviors = [], []
+        error = None
+        if not self.pack:
+            error = ("No world pack found (worldserver.json WorldPack). Gameplay > Edit Scripts > "
+                     "File > Choose Pack Folder picks one.")
+        else:
+            try:
+                self.types = npcs_mod.load_types(self.pack)
+                self.behaviors = npcs_mod.behaviors(self.pack)
+            except npcs_mod.NpcError as exc:
+                error = str(exc)
+        self._fill_types()
+        if error:
+            self.note.setText(error)
+        else:
+            named = sum(1 for t in self.types if t.name)
+            self.note.setText(f"{len(self.types)} NPC types in the world pack ({named} with a known "
+                              f"name). Drag one into the Render Window to place it; double-click a "
+                              f"placed NPC for its record. Publish writes them to the world.")
+        self.refresh()
+        self.types_loaded.emit()
+
+    def type_by_id(self, type_id):
+        return next((t for t in self.types if t.id == type_id), None)
+
+    def _fill_types(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(self.types))
+        mono = QFont(self.font())
+        mono.setFamily("Courier New" if "light" in COLORS else "Consolas")
+        for i, t in enumerate(self.types):
+            name = QTableWidgetItem(t.label)
+            name.setData(Qt.UserRole, t.id)
+            if not t.name:
+                name.setForeground(QColor(COLORS.get("muted", "#808080")))
+                name.setToolTip("The pack keeps this type's name as encoded text; this is a stand-in.")
+            tid = QTableWidgetItem(t.id)
+            tid.setFont(mono)
+            prof = QTableWidgetItem(t.profession)
+            lvl = QTableWidgetItem()
+            lvl.setData(Qt.DisplayRole, int(t.level))
+            team = QTableWidgetItem(("hostile " if t.hostile else "") + t.team)
+            if t.hostile:
+                team.setForeground(QColor("#c04040"))
+            home = QTableWidgetItem("-" if t.home_map is None else str(t.home_map))
+            for col, it in enumerate((name, tid, prof, lvl, team, home)):
+                self.table.setItem(i, col, it)
+        self.table.setSortingEnabled(True)
+        self._apply_filter()
+
+    def _apply_filter(self):
+        words = self.filter.text().lower().split()
+        for r in range(self.table.rowCount()):
+            text = " ".join((self.table.item(r, c).text() if self.table.item(r, c) else "")
+                            for c in range(self.table.columnCount())).lower()
+            self.table.setRowHidden(r, not all(w in text for w in words))
+
+    # -- the map's placed NPCs
+    def refresh(self):
+        p = self.doc.project
+        rows = list(p.npcs) if p is not None else []
+        self._sync = True
+        self.placed.setRowCount(len(rows))
+        for i, n in enumerate(rows):
+            t = self.type_by_id(n.definition)
+            a = QTableWidgetItem(n.id)
+            b = QTableWidgetItem(n.name or (t.label if t else ""))
+            if not n.name:
+                b.setForeground(QColor(COLORS.get("muted", "#808080")))
+            c = QTableWidgetItem(n.definition)
+            if self.types and t is None:
+                c.setForeground(QColor("#c04040"))
+                c.setToolTip("This type is not in the world pack's npcs/definitions.json.")
+            d = QTableWidgetItem(f"{n.x:,.0f}")
+            e = QTableWidgetItem(f"{n.y:,.0f}")
+            for col, it in enumerate((a, b, c, d, e)):
+                self.placed.setItem(i, col, it)
+        self.placed_label.setText(f"Placed on this map: {len(rows)}" if p is not None
+                                  else "Placed on this map: no map open")
+        self._sync = False
+        self._select_row(self.doc.selected_npc)
+
+    def _picked(self):
+        if self._sync:
+            return
+        rows = self.placed.selectionModel().selectedRows()
+        self.doc.select_npc(rows[0].row() if rows else -1)
+
+    def _select_row(self, i):
+        self._sync = True
+        if 0 <= i < self.placed.rowCount():
+            self.placed.selectRow(i)
+        else:
+            self.placed.clearSelection()
+        self._sync = False
+
+    def _selected(self):
+        rows = self.placed.selectionModel().selectedRows()
+        return rows[0].row() if rows else -1
+
+    def _menu(self, pos):
+        row = self.placed.rowAt(pos.y())
+        if row < 0:
+            return
+        self.placed.selectRow(row)
+        menu = QMenu(self)
+        props = menu.addAction("Properties...")
+        goto = menu.addAction("Go To")
+        delete = menu.addAction("Delete")
+        act = menu.exec(self.placed.viewport().mapToGlobal(pos))
+        if act is props:
+            self._properties()
+        elif act is goto:
+            self._goto()
+        elif act is delete:
+            self._delete()
+
+    def _properties(self):
+        i = self._selected()
+        if i >= 0:
+            self.edit_requested.emit(i)
+
+    def _goto(self):
+        i = self._selected()
+        p = self.doc.project
+        if p is not None and 0 <= i < len(p.npcs):
+            self.go_requested.emit(p.npcs[i].x, p.npcs[i].y)
+
+    def _delete(self):
+        i = self._selected()
+        p = self.doc.project
+        if p is None or not (0 <= i < len(p.npcs)):
+            return
+        from .document import NpcsCommand, copy_npcs
+        before = copy_npcs(p)
+        after = [n for k, n in enumerate(before) if k != i]
+        self.doc.undo.push(NpcsCommand(self.doc, before, after, f"Delete {before[i].id}"))
+        self.doc.select_npc(-1)
+
+
 class ObjectWindow(QWidget):
     open_project = Signal(str)
     new_map_requested = Signal()
     prop_go = Signal(float, float)
     edit_prop = Signal(int)
+    npc_go = Signal(float, float)
+    edit_npc = Signal(int)
 
     def __init__(self, doc, parent=None):
         super().__init__(parent)
@@ -586,18 +959,24 @@ class ObjectWindow(QWidget):
         self.textures = TexturesPage()
         self.models = ModelsPage()
         self.props = PropsPage(doc)
+        self.flora = FloraPage(doc)
+        self.npcs = NpcsPage(doc)
         self.tabs.addTab(self.spawns, "Spawn Points")
         self.tabs.addTab(self.maps, "Maps")
         self.tabs.addTab(self.terrain, "Terrain")
         self.tabs.addTab(self.textures, "Textures")
+        self.tabs.addTab(self.flora, "Flora")
         self.tabs.addTab(self.models, "Models")
         self.tabs.addTab(self.props, "Props")
+        self.tabs.addTab(self.npcs, "NPCs")
         lay.addWidget(self.tabs, 1)
         self.maps.open_requested.connect(self.open_project.emit)
         self.maps.new_requested.connect(self.new_map_requested.emit)
         self.props.go_requested.connect(self.prop_go.emit)
         self.props.edit_requested.connect(self.edit_prop.emit)
         self.props.model_requested.connect(self.show_prop_properties)
+        self.npcs.go_requested.connect(self.npc_go.emit)
+        self.npcs.edit_requested.connect(self.edit_npc.emit)
 
     def show_spawns(self):
         self.tabs.setCurrentWidget(self.spawns)
@@ -611,11 +990,17 @@ class ObjectWindow(QWidget):
     def show_textures(self):
         self.tabs.setCurrentWidget(self.textures)
 
+    def show_flora(self):
+        self.tabs.setCurrentWidget(self.flora)
+
     def show_models(self):
         self.tabs.setCurrentWidget(self.models)
 
     def show_props(self):
         self.tabs.setCurrentWidget(self.props)
+
+    def show_npcs(self):
+        self.tabs.setCurrentWidget(self.npcs)
 
     def show_prop_properties(self, i):
         self.show_props()
@@ -624,5 +1009,6 @@ class ObjectWindow(QWidget):
 
     def set_assets(self, assets, error=None):
         self.textures.set_assets(assets, error)
+        self.flora.set_assets(assets, error)
         self.models.set_assets(assets, error)
         self.props.set_assets(assets, error)

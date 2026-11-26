@@ -5,3 +5,11 @@ __pycache__/
 # kept local: notes and game-derived screenshots
 history.doc
 docs/
+# Study output from your own Gw.dat (ArenaNet bytes): never committed.
+tools/zones_*/
+tools/terrain_flora_*/
+tools/*_summary.txt
+tools/zones_survey.txt
+tools/map_parts.txt
+tools/npc_models/
+tools/game_map_check.txt

@@ -28,8 +28,8 @@ from .cell_view import CellView
 from .deploy_window import DeployWindow
 from .images import qimage
 from .loading import LoadingPopup
-from .document import (Document, PropsCommand, SpawnsCommand, TilesCommand, copy_props, copy_spawns,
-                       copy_tiles)
+from .document import (Document, NpcsCommand, PropsCommand, SpawnsCommand, TilesCommand, copy_npcs,
+                       copy_props, copy_spawns, copy_tiles)
 from .new_map_dialog import NewMapDialog
 from .object_window import ObjectWindow
 from .panels import BrushPanel, LogPanel, MapPanel, ProblemsPanel
@@ -213,12 +213,27 @@ class MainWindow(QMainWindow):
         self.render.view3d.model_dropped.connect(self._place_model)
         self.render.view3d.prop_activated.connect(self._prop_properties)
         self.objectwin.edit_prop.connect(self._prop_properties)
+        self.render.view3d.npc_dropped.connect(self._place_npc)
+        self.render.view3d.npc_activated.connect(self._npc_properties)
+        self.objectwin.edit_npc.connect(self._npc_properties)
+        self.objectwin.npc_go.connect(self._goto)
+        self.doc.npcs_changed.connect(self._npcs_changed)
+        self.doc.npcs_changed.connect(self._counts)
+        self.doc.npcs_changed.connect(self._selection)
+        self.doc.npc_selection_changed.connect(self._selection)
+        self.doc.npc_selection_changed.connect(lambda _i: self.render.view3d.update())
         self.problems.goto.connect(self._goto)
         self.problems.recheck.connect(self._validate)
         self.objectwin.open_project.connect(self.open_map)
         self.objectwin.new_map_requested.connect(self.new_map)
         self.objectwin.prop_go.connect(self._goto)
         self.objectwin.textures.texture_selected.connect(self._texture_selected)
+        self.objectwin.flora.flora_selected.connect(self._flora_selected)
+        self.objectwin.flora.show_toggled.connect(self.render.view3d.set_show_flora)
+        self.brushes.choose_flora.connect(self._show_flora)
+        self.doc.flora_changed.connect(self.render.view3d.update)
+        self.doc.flora_changed.connect(self.objectwin.flora.refresh)
+        self.doc.project_changed.connect(self.objectwin.flora.refresh)
         self.doc.project_changed.connect(self._title)
         self.doc.project_changed.connect(self._counts)
         self.doc.project_changed.connect(self._selection)
@@ -240,6 +255,7 @@ class MainWindow(QMainWindow):
         self.doc.undo.cleanChanged.connect(self._clean_changed)
         self.doc.status.connect(self.logp.log)
         self.d_land.visibilityChanged.connect(self._landscape_visible)
+        self._load_npc_types()
         self._title()
         self._counts()
         self._selection()
@@ -305,18 +321,23 @@ class MainWindow(QMainWindow):
                                   checkable=True, icon="sculpt")
         self.a_select = self._act("Select", lambda on: on and self.set_tool("select"), "V",
                                   checkable=True, icon="select")
+        self.a_flora = self._act("Flora", lambda on: on and self.set_tool("flora"), "G",
+                                 "Paint where the donor's flora grows: left drag paints the type "
+                                 "chosen in Object Window > Flora, right drag clears",
+                                 checkable=True, icon="flora")
         tgrp = QActionGroup(self)
         tgrp.setExclusive(True)
-        for a in (self.a_sculpt, self.a_select):
+        for a in (self.a_sculpt, self.a_select, self.a_flora):
             tgrp.addAction(a)
         self.a_sculpt.setChecked(True)
 
         f = m.addMenu("&File")
         self.a_new = self._act("&New map...", self.new_map, "Ctrl+N", icon="new")
         self.a_open = self._act("&Open...", self.open_map, "Ctrl+O", icon="open")
+        self.a_open_game = self._act("Open &Game Map...", self.open_game_map, "Ctrl+Shift+O")
         self.a_save = self._act("&Save", self.save, "Ctrl+S", icon="save")
         self.a_saveas = self._act("Save &as...", self.save_as, "Ctrl+Shift+S")
-        f.addActions([self.a_new, self.a_open, self.a_save, self.a_saveas])
+        f.addActions([self.a_new, self.a_open, self.a_open_game, self.a_save, self.a_saveas])
         self.recent_menu = f.addMenu("Open &recent")
         self._recent()
         f.addSeparator()
@@ -399,6 +420,7 @@ class MainWindow(QMainWindow):
         u.addAction(self._act("T&extures", self._show_textures))
         u.addAction(self._act("&Models", self._show_models))
         u.addAction(self._act("&Props", self._show_props))
+        u.addAction(self._act("&NPCs", self._show_npcs))
         u.addSeparator()
         u.addAction(self._act("World &Map...", self.world_map, "Ctrl+M",
                               "The client's area table over its world atlas (read-only)", icon="world"))
@@ -414,6 +436,9 @@ class MainWindow(QMainWindow):
         c.addAction(self.a_seed)
 
         g = m.addMenu("&Gameplay")
+        g.addAction(self._act("Edit &Scripts...", self.edit_scripts, "Ctrl+E",
+                              "The pack's Lua: dialogs, behaviours, skills and the runtime", icon="open"))
+        g.addSeparator()
         g.addAction(self._act("&Validate", self._validate, "F7", "Run the slope, reachability and build checks"))
         g.addAction(self.a_problems)
 
@@ -430,7 +455,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addActions([undo, redo])
         tb.addSeparator()
-        for a in (self.a_sculpt, self.a_select):
+        for a in (self.a_sculpt, self.a_select, self.a_flora):
             tb.addAction(a)
         tb.addSeparator()
         tb.addActions([self.a_view3d, self.a_viewtop])
@@ -502,10 +527,15 @@ class MainWindow(QMainWindow):
             w.update()
 
     def set_tool(self, key):
-        if key not in ("sculpt", "select"):
+        if key not in ("sculpt", "select", "flora"):
+            key = "select"
+        p = self.doc.project
+        if key == "sculpt" and p is not None and getattr(p, "stock", False):
+            self.logp.log("a game map's ground and textures are not reshaped here; "
+                          "Select (props, NPCs) and Flora are the tools for it")
             key = "select"
         self.render.set_tool(key)
-        a = {"sculpt": self.a_sculpt, "select": self.a_select}[key]
+        a = {"sculpt": self.a_sculpt, "select": self.a_select, "flora": self.a_flora}[key]
         if not a.isChecked():
             a.setChecked(True)
         self.brushes.set_mode(key)
@@ -796,8 +826,8 @@ class MainWindow(QMainWindow):
         so a map painted before the brushes enforced the limit is repaired on
         open (one undoable step) rather than crashing the client later."""
         p = self.doc.project
-        if p is None or not p.tiles or not self.doc.tile_types:
-            return 0
+        if p is None or not p.tiles or not self.doc.tile_types or getattr(p, "stock", False):
+            return 0                    # a game map's textures are ArenaNet's and are not rewritten
         a = self.assets
         if a is None or int(a.donor_file_id) != int(p.donor_file_id):
             return 0                    # the loaded table belongs to another donor
@@ -815,6 +845,15 @@ class MainWindow(QMainWindow):
     def _textures_undone(self, rect):
         if rect is None and self.doc.tile_types:      # undo/redo/fix, not a brush dab
             self.doc.analyse()
+
+    def _flora_selected(self, name):
+        self.render.view3d.set_flora_type(name)
+        self.brushes.set_flora(name)
+        self.set_tool("flora")
+        self.logp.log(f"flora brush: {name}")
+
+    def _show_flora(self):
+        self._show_object(self.objectwin.show_flora)
 
     def _texture_selected(self, tile):
         self.render.set_paint_texture(tile)
@@ -840,6 +879,59 @@ class MainWindow(QMainWindow):
         self.doc.select_prop(len(after) - 1)
         self.logp.log(f"placed model 0x{q.file_id:X} at {q.x:,.0f}, {q.y:,.0f}, {q.z:,.0f}")
 
+    # ------------------------------------------------------------ NPCs
+
+    def _load_npc_types(self):
+        """The world pack's NPC types for the NPCs tab and the Render Window's colours."""
+        from .script_window import default_pack
+        page = self.objectwin.npcs
+        page.pack_source = lambda: default_pack(self.prefs)
+        page.types_loaded.connect(self._npc_types_loaded)
+        page.reload()
+
+    def _npc_types_loaded(self):
+        page = self.objectwin.npcs
+        view = self.render.view3d
+        view.set_npc_hostile(t.id for t in page.types if t.hostile)
+        view.set_npc_bodies({t.id: (t.bodies, t.scale) for t in page.types})
+        self._npcs_changed()
+
+    def _npcs_changed(self):
+        """Load the meshes of NPC types just placed (with the prop models), else redraw."""
+        view = self.render.view3d
+        missing = view.npc_mesh_ids() - set(self.model_geometry) - self._models_failed_ids()
+        if missing and self.doc.project is not None:
+            self._ensure_prop_geometry()
+        else:
+            view.update()
+
+    def _show_npcs(self):
+        self._show_object(self.objectwin.show_npcs)
+
+    def _place_npc(self, payload):
+        from .. import npcs as npcs_mod
+        from ..model import PlacedNpc
+        p = self.doc.project
+        if p is None:
+            return
+        before = copy_npcs(p)
+        n = PlacedNpc(id=npcs_mod.next_id(p), definition=str(payload["definition"]),
+                      x=float(payload["x"]), y=float(payload["y"]))
+        after = before + [n]
+        self.doc.undo.push(NpcsCommand(self.doc, before, after, f"Place {n.id}"))
+        self.doc.select_npc(len(after) - 1)
+        t = self.objectwin.npcs.type_by_id(n.definition)
+        self.logp.log(f"placed NPC {n.id} ({t.label if t else n.definition}) at {n.x:,.0f}, {n.y:,.0f}")
+
+    def _npc_properties(self, i):
+        from .npc_dialog import NpcDialog
+        p = self.doc.project
+        if p is None or not (0 <= i < len(p.npcs)):
+            return
+        self.doc.select_npc(i)
+        page = self.objectwin.npcs
+        NpcDialog(self, self.doc, i, page.types, page.behaviors).exec()
+
     def _props_changed(self):
         self._ensure_prop_geometry()
         self._counts()
@@ -860,8 +952,8 @@ class MainWindow(QMainWindow):
             self.render.view3d.set_props([], {})
             return
         dat = self.prefs.get("archive", "")
-        missing = sorted({q.file_id for q in p.props} - set(self.model_geometry)
-                         - self._models_failed_ids())
+        wanted = {q.file_id for q in p.props} | self.render.view3d.npc_mesh_ids()
+        missing = sorted(wanted - set(self.model_geometry) - self._models_failed_ids())
         if dat and missing:
             if self._models_job is not None:
                 self._models_again = True       # load the rest when this batch lands
@@ -956,14 +1048,17 @@ class MainWindow(QMainWindow):
             self.st_sel.setText("")
             return
         faces = max(0, (p.dim_x - 1) * (p.dim_y - 1))
-        objects = len(p.spawns) + len(p.props)
+        objects = len(p.spawns) + len(p.props) + len(p.npcs)
         self.st_counts.setText(f"Objects: {objects}   Faces: {faces:,}   Cells: {p.dim_x}x{p.dim_y}")
 
     def _selection(self, *_args):
         p = self.doc.project
         i = self.doc.selected
         pi = self.doc.selected_prop
-        if p is not None and 0 <= pi < len(p.props):
+        ni = self.doc.selected_npc
+        if p is not None and 0 <= ni < len(p.npcs):
+            self.st_sel.setText(f"[Sel Obj: {p.npcs[ni].id}]")
+        elif p is not None and 0 <= pi < len(p.props):
             self.st_sel.setText(f"[Sel Obj: prop_{pi}]")
         elif p is not None and 0 <= i < len(p.spawns):
             seed = " (seed)" if i == 0 else ""
@@ -1064,6 +1159,73 @@ class MainWindow(QMainWindow):
         self.objectwin.maps.refresh()
         self.logp.log(f"opened {path}")
 
+    def open_game_map(self):
+        """File > Open Game Map: one of the pack's maps, read out of Gw.dat (kryta_cs/stock.py)."""
+        from .. import kryta
+        from ..model import slugify
+        from .game_map_dialog import GameMapDialog
+        from .script_window import default_pack
+        if not self._maybe_save():
+            return
+        repo = paths.REPO_ROOT
+        if not repo:
+            QMessageBox.warning(self, "Open Game Map", "No Kryta checkout was found around the editor, "
+                                "so there is no list of maps.")
+            return
+        dat = self.prefs.get("archive") or kryta.server_archive(repo) or ""
+        if not dat or not os.path.isfile(dat):
+            QMessageBox.warning(self, "Open Game Map", "Choose your Gw.dat first (World > Build & "
+                                "Deploy, the archive field).")
+            return
+        dlg = GameMapDialog(self, kryta.read_catalogue(repo))
+        if not dlg.exec() or dlg.chosen() is None:
+            return
+        r = dlg.chosen()
+        title = r.name or f"Map {r.map_id}"
+        path = os.path.join(paths.projects_dir(), f"game-{r.map_id}-{slugify(title)}.kmap.json")
+        if os.path.exists(path):
+            ans = QMessageBox.question(
+                self, "Open Game Map",
+                f"You have saved edits of {title}:\n{path}\n\nOpen them? (No starts again from "
+                f"the map as it ships.)", QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            if ans == QMessageBox.Cancel:
+                return
+            if ans == QMessageBox.Yes:
+                self.open_map(path)
+                return
+            path = None
+        pack = default_pack(self.prefs)
+        self.loading.begin("game", f"Reading {title} out of Gw.dat ...")
+        self.logp.log(f"opening game map {r.map_id} {title} (file 0x{r.file_id:X})")
+        self._game_open = (title, path)
+
+        def job(_report):
+            from .. import stock
+            return stock.open_map(dat, r.file_id, r.map_id, title, r.map_type or 1, pack)
+
+        # The handlers are this window's own methods: a signal from the worker thread then runs
+        # them on the GUI thread. A plain local function would run on the worker, and a message
+        # box opened there takes the whole editor down (2026-11-25, Diessa Lowlands).
+        self._spawn(job, self._game_map_opened, self._game_map_failed)
+
+    def _game_map_opened(self, p):
+        title, path = getattr(self, "_game_open", (p.name, None))
+        self.loading.end("game")
+        p.path = path
+        self.doc.set_project(p)
+        self.doc.undo.resetClean()
+        self.objectwin.maps.refresh()
+        self.set_tool("select")
+        self.logp.log(f"{title}: {p.dim_x}x{p.dim_y} cells, {len(p.props)} prop(s), "
+                      f"{len(p.flora)} flora area(s), {len(p.npcs)} NPC(s). Save to keep your "
+                      f"edits; Build & Deploy writes them.")
+
+    def _game_map_failed(self, msg):
+        title, _path = getattr(self, "_game_open", ("the map", None))
+        self.loading.end("game")
+        self.logp.log(f"open game map: {msg}")
+        QMessageBox.warning(self, "Open Game Map", f"Could not open {title}:\n\n{msg}")
+
     def save(self) -> bool:
         p = self.doc.project
         if p is None:
@@ -1126,6 +1288,20 @@ class MainWindow(QMainWindow):
         win.activateWindow()
         return win
 
+    def edit_scripts(self, rel=None, line=None):
+        """Gameplay > Edit Scripts: one Script Edit window, kept and raised on the next open.
+        `rel` (pack-relative) opens that file, at `line` if given."""
+        from .script_window import ScriptWindow
+        win = getattr(self, "_scripts", None)
+        if win is None:
+            win = self._scripts = ScriptWindow(self.prefs, None)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        if isinstance(rel, str) and rel:
+            win.open_file(rel, line)
+        return win
+
     def _goto(self, x, y):
         p = self.doc.project
         if p is None:
@@ -1171,9 +1347,15 @@ class MainWindow(QMainWindow):
             "your own Gw.dat at build time.</p>"))
 
     def closeEvent(self, ev):
+        scripts = getattr(self, "_scripts", None)
+        if scripts is not None and not scripts._close_buffers():
+            ev.ignore()
+            return
         if not self._maybe_save():
             ev.ignore()
             return
+        if scripts is not None:
+            scripts.close()
         # Close at once: hide the popup, stop the terrain blend, and tell the
         # background readers to stop at their next texture or model instead of
         # waiting for a whole donor scan to finish.

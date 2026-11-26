@@ -106,6 +106,19 @@ def _sculpt(qp, size):
     qp.drawLine(0, 15, 15, 15)
 
 
+def _flora(qp, size):
+    qp.setPen(QPen(QColor("#2f7d32"), 1))
+    for x0, x1, top in ((3, 1, 6), (5, 6, 3), (8, 9, 2), (10, 13, 5), (12, 15, 8)):
+        qp.drawLine(x0, 14, x1, top)
+    qp.setPen(QPen(QColor("#c9a227"), 1))
+    qp.drawLine(7, 14, 7, 4)
+    qp.setBrush(QColor("#e0b52c"))
+    qp.setPen(Qt.NoPen)
+    qp.drawEllipse(QRectF(6, 2, 3, 4))
+    qp.setPen(QPen(QColor("#000000"), 1))
+    qp.drawLine(0, 15, 15, 15)
+
+
 def _spawn(qp, size):
     qp.setPen(QPen(QColor("#000000"), 1))
     qp.drawLine(4, 2, 4, 15)
@@ -262,7 +275,7 @@ def _app(qp, size):
 
 _DRAWN = {
     "new": _new, "open": _open, "save": _save, "undo": _undo, "redo": _redo,
-    "sculpt": _sculpt, "spawn": _spawn, "select": _select,
+    "sculpt": _sculpt, "spawn": _spawn, "select": _select, "flora": _flora,
     "slopes": _slopes, "reach": _reach, "contours": _contours, "grid": _grid,
     "deploy": _deploy, "world": _world, "objects": _objects, "cell": _cell,
     "fit": _fit, "tube": _tube, "wire": _wire, "cells": _cells,
